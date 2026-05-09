@@ -1,0 +1,88 @@
+# ==========================================
+# Công cụ tự động đăng ký ChatGPT - mẫu file cấu hình
+# Hướng dẫn sử dụng:
+# 1. Sao chép file này thành config.yaml
+# 2. Sửa cấu hình trong config.yaml
+# ==========================================
+
+# Cấu hình đăng ký
+registration:
+  total_accounts: 1      # Số lượng tài khoản đăng ký hàng loạt
+  min_age: 26            # Tuổi nhỏ nhất khi tạo ngày sinh ngẫu nhiên
+  max_age: 40            # Tuổi lớn nhất khi tạo ngày sinh ngẫu nhiên
+
+# Dịch vụ email Hotmail/Outlook qua API dongvanfb
+email:
+  mode: "hotmail"
+  accounts_file: "hotmail_accounts.txt"
+  api_url: "https://tools.dongvanfb.net/api/get_code_oauth2"
+  messages_api_url: "https://tools.dongvanfb.net/api/get_messages_oauth2"
+  type: "all"
+  wait_timeout: 60      # Quá 60 giây không có OTP thì hủy profile để chạy lại từ đầu
+  poll_interval: 1      # Khoảng cách gọi API lấy mã (giây)
+  initial_delay: 0      # Gọi API đọc OTP ngay sau khi bấm tiếp tục
+  fallback_enabled: true # Dùng get_code_oauth2 nếu get_messages_oauth2 chưa thấy mail mới
+  fallback_after: 0     # 0 = gọi get_code_oauth2 ngay để điền OTP nhanh nhất
+  request_timeout: 5    # Timeout mỗi lượt gọi API mail, tránh treo lâu khi API chậm
+
+# Cấu hình tự động hóa trình duyệt
+browser:
+  max_wait_time: 600    # Thời gian chờ tối đa toàn cục
+  short_wait_time: 120  # Thời gian chờ cho tác vụ ngắn
+  user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+  gpm_enabled: false    # Bật true để dùng trình duyệt anti-detect GPM Login thay Chrome thường
+  gpm_api_url: "http://localhost:9495"
+  gpm_profile_ids: []   # Ví dụ: ["profile_id_1", "profile_id_2"]; chạy song song cần đủ số profile
+  gpm_start_endpoint: "/api/v1/profiles/start/{profile_id}"
+  gpm_auto_create: false # true = tự tạo profile GPM mới mỗi lần mở browser nếu không chỉ định profile ID
+  gpm_auto_profile_prefix: "chatgpt-auto"
+  gpm_group_name: "All"
+  gpm_browser_version: "auto" # auto = lấy version từ profile GPM có sẵn; nếu chưa có profile thì điền version đã cài trong GPM
+  gpm_os_type: 3      # 1 Windows, 2 macOS Intel, 3 macOS ARM, 4 Linux, 5 Android
+  gpm_os: "macOS ARM"
+  gpm_raw_proxy: ""     # Có proxy thì điền theo format GPM, ví dụ socks5://IP:Port:User:Pass
+  gpm_delete_created_on_close: true  # true = đóng xong xoá profile vừa tạo
+  background_mode: false # true = cố gắng chạy cửa sổ trình duyệt ngầm/off-screen
+  offscreen_x: -10000    # Vị trí X khi chạy ngầm
+  offscreen_y: -10000    # Vị trí Y khi chạy ngầm
+  visible_grid_enabled: false # true = chia các profile đang chạy thành lưới trên màn hình
+  visible_grid_cols: 2
+  visible_grid_rows: 2
+  visible_window_width: 720
+  visible_window_height: 450
+  visible_start_x: 0
+  visible_start_y: 0
+
+# Quy tắc mật khẩu tài khoản
+password:
+  length: 16
+  # Bộ ký tự mật khẩu, gồm chữ hoa, chữ thường và chữ số
+  charset: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+# Chính sách retry khi lỗi
+retry:
+  http_max_retries: 5       # Số lần retry HTTP tối đa
+  http_timeout: 30          # Thời gian timeout HTTP
+  error_page_max_retries: 5 # Số lần làm mới tối đa khi gặp trang lỗi
+  button_click_max_retries: 3 # Số lần click nút tối đa
+
+# Khoảng cách giữa các lần đăng ký hàng loạt
+batch:
+  interval_min: 5  # Khoảng cách nhỏ nhất (giây)
+  interval_max: 15 # Khoảng cách lớn nhất (giây)
+
+# Thông tin thanh toán dùng để tự động liên kết dùng thử Plus
+# Cảnh báo: Không nhập thông tin thẻ tín dụng thật vào file này nếu file có thể bị công khai
+payment:
+  checkout_enabled: true
+  flow: "trial_free" # trial_free = dùng luồng cũ; petrix = dùng API Petrix nếu cần
+  credit_card:
+    number: "YOUR_CREDIT_CARD_NUMBER" # Số thẻ tín dụng
+    expiry: "MMYY"                    # Ngày hết hạn, định dạng MMYY, ví dụ 1225
+    expiry_month: "12"                # Tháng hết hạn
+    expiry_year: "2025"               # Năm hết hạn
+    cvc: "123"                        # Mã bảo mật
+
+# Cấu hình đường dẫn file
+files:
+  accounts_file: "registered_accounts.txt"  # Đường dẫn lưu tài khoản đăng ký thành công

@@ -1,0 +1,19 @@
+[project]
+name = "chatgpt-auto-register"
+version = "0.1.0"
+description = "Automated ChatGPT account registration and management tool using Selenium."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "faker>=40.1.0",
+    "flask>=3.1.2",
+    "pandas>=2.3.3",
+    "pyyaml>=6.0.3",
+    "requests>=2.32.5",
+    "selenium>=4.39.0",
+    "setuptools>=80.0.0",
+    "streamlit>=1.52.2",
+    "undetected-chromedriver>=3.5.5",
+    "waitress>=3.0.2",
+    "watchdog>=6.0.0",
+]

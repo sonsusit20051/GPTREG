@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="vi">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AutoGPT Console</title>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+
+    <!-- Sidebar -->
+    <aside class="sidebar">
+        <div class="brand">
+            <div class="brand-icon">⚡</div>
+            <div class="brand-text">AutoGPT</div>
+        </div>
+
+        <nav class="nav-menu">
+            <div class="nav-item active" onclick="switchTab('dashboard')">
+                <span>📊</span> Bảng điều khiển
+            </div>
+            <div class="nav-item" onclick="switchTab('accounts')">
+                <span>👥</span> Quản lý tài khoản
+            </div>
+        </nav>
+
+        <div class="control-box">
+            <div class="control-header">Điều khiển tác vụ</div>
+
+            <div class="ctrl-row">
+                <label class="ctrl-label">Số lượng đăng ký</label>
+                <input type="number" id="targetCount" class="ctrl-input" value="1" min="1" max="50">
+            </div>
+
+            <button id="btnStart" class="btn btn-primary" onclick="startTask()">
+                <span>🚀</span> Bắt đầu tác vụ
+            </button>
+            <button id="btnStop" class="btn btn-danger hidden" onclick="stopTask()">
+                <span>🛑</span> Dừng chạy
+            </button>
+        </div>
+    </aside>
+
+    <!-- Main Content -->
+    <main class="main-view">
+
+        <!-- Header -->
+        <header class="page-header">
+            <h2 class="page-title">Tổng quan hệ thống</h2>
+            <div class="status-badge">
+                <span class="status-dot" id="statusDot"></span>
+                <span id="statusText">Hệ thống sẵn sàng</span>
+            </div>
+            <div class="status-badge">
+                <span id="backendVersion">Backend: đang tải...</span>
+            </div>
+        </header>
+
+        <!-- Dashboard Tab -->
+        <div id="view-dashboard" class="view-section">
+
+            <!-- Cards Grid -->
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-label">Bước hiện tại</div>
+                    <div class="stat-value" id="valAction" style="font-size: 18px;">Đang chờ bắt đầu</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Thành công lần này</div>
+                    <div class="stat-value green" id="valSuccess">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Thất bại lần này</div>
+                    <div class="stat-value red" id="valFail">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Tổng tài khoản lưu kho</div>
+                    <div class="stat-value blue" id="valInventory">0</div>
+                </div>
+            </div>
+
+            <!-- Monitor & Logs (Split View) -->
+            <div class="split-view">
+                <!-- Monitor -->
+                <div class="panel">
+                    <div class="panel-header">
+                        <div class="panel-title">
+                            <span>📺</span> Hình ảnh trực tiếp
+                        </div>
+                        <span class="status-pill neutral" id="monitorStatus">OFFLINE</span>
+                    </div>
+                    <div class="monitor-body">
+                        <img id="liveMonitor" class="monitor-img hidden" src="" alt="Monitor">
+                        <div id="noSignal" style="color:#666; font-size:12px">Đang chờ tín hiệu...</div>
+                    </div>
+                </div>
+
+                <!-- Logs -->
+                <div class="panel">
+                    <div class="panel-header">
+                        <div class="panel-title">
+                            <span>📜</span> Nhật ký terminal
+                        </div>
+                        <button class="action-btn" onclick="clearLogs()">Xóa</button>
+                    </div>
+                    <div class="log-body" id="logContainer">
+                        <div style="color: #666; text-align: center; margin-top: 20px;">> Ready to start...</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Accounts Tab -->
+        <div id="view-accounts" class="view-section hidden">
+            <div class="panel">
+                <div class="panel-header">
+                    <input type="text" id="searchInput" placeholder="Tìm kiếm email..." class="ctrl-input" style="width: 300px"
+                        onkeyup="filterAccounts()">
+                    <button class="action-btn" onclick="loadAccounts()">🔄 Làm mới danh sách</button>
+                </div>
+                <div class="table-container" style="border:none; box-shadow:none; border-radius:0">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Cụm mail</th>
+                                <th>Link pay</th>
+                                <th>Thời gian</th>
+                                <th>Thao tác</th>
+                            </tr>
+                        </thead>
+                        <tbody id="accountTableBody">
+                            <!-- Data -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+    </main>
+
+    <script src="script.js"></script>
+</body>
+
+</html>
