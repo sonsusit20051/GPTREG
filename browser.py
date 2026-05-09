@@ -3242,6 +3242,18 @@ def fill_signup_form(driver, email: str, password: str):
                     saw_error_page = True
                     break
 
+                password_switch_candidates = _find_continue_with_password_candidates(driver)
+                if password_switch_candidates:
+                    print("🔒 Đang thấy nút 'Tiếp tục với mật khẩu', bắt buộc chuyển sang flow mật khẩu trước OTP...")
+                    if click_continue_with_password(driver, timeout=4):
+                        _wait_for_url_or_dom_settle(driver, timeout=6, stable_for=0.6)
+                        last_state = ""
+                        same_state_since = time.time()
+                        continue
+                    print("⚠️ Nút 'Tiếp tục với mật khẩu' đang hiện nhưng chưa click được, sẽ tiếp tục ưu tiên thử lại")
+                    time.sleep(0.25)
+                    continue
+
                 state, detail = classify_after_email_continue(driver)
                 if state != last_state:
                     if detail:
@@ -3267,6 +3279,10 @@ def fill_signup_form(driver, email: str, password: str):
                     break
 
                 if state == "otp":
+                    if _find_continue_with_password_candidates(driver):
+                        print("🔒 Dù đã thấy ô OTP nhưng nút 'Tiếp tục với mật khẩu' vẫn còn, tiếp tục ép sang flow mật khẩu")
+                        time.sleep(0.25)
+                        continue
                     visible_code_inputs = _visible_elements(driver, CODE_INPUT_SELECTOR)
                     code_input = visible_code_inputs[0] if visible_code_inputs else find_code_input_fast(driver, timeout=0.5)
                     break
