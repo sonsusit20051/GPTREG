@@ -3371,7 +3371,7 @@ def fill_signup_form(driver, email: str, password: str):
         print("✅ Đã click tiếp tục")
 
         check_and_handle_error(driver)
-        post_password_deadline = time.time() + 15
+        post_password_deadline = time.time() + 10
         last_state = ""
         while time.time() < post_password_deadline:
             state, detail = classify_after_password_submit(driver)

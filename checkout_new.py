@@ -215,6 +215,29 @@ def _get_access_token_from_browser_context(driver, log_func=None) -> str | None:
     return None
 
 
+def extract_checkout_auth_context(driver, log_func=None) -> dict[str, Any]:
+    token = _get_access_token_from_browser_context(driver, log_func=log_func)
+    if not token:
+        token = _get_access_token_from_session(driver, log_func=log_func)
+
+    cookies = []
+    try:
+        cookies = list(driver.get_cookies() or [])
+    except Exception as e:
+        _log(log_func, f"   ⚠️ Không đọc được cookies từ browser: {e}")
+
+    try:
+        user_agent = driver.execute_script("return navigator.userAgent || ''") or ""
+    except Exception:
+        user_agent = ""
+
+    return {
+        "token": token or "",
+        "cookies": cookies,
+        "user_agent": user_agent or "Mozilla/5.0",
+    }
+
+
 def _browser_fetch_checkout(driver, payload: dict[str, Any], log_func=None) -> dict[str, Any]:
     _log(log_func, "   🌐 Đang gọi checkout API trực tiếp trong browser...")
     bearer_token = _get_access_token_from_browser_context(driver, log_func=log_func)
@@ -363,6 +386,58 @@ def _requests_checkout(driver, payload: dict[str, Any], log_func=None) -> dict[s
 
     if resp.ok:
         return _normalize_checkout_result(data)
+
+    return {
+        "success": False,
+        "failure_reason": f"Checkout API lỗi HTTP {resp.status_code}: {data}",
+        "raw": data,
+    }
+
+
+def create_trial_checkout_from_auth_context(
+    auth_context: dict[str, Any],
+    country_code: str = "ID",
+    currency: str = "IDR",
+    log_func=None,
+) -> dict[str, Any]:
+    payload = _checkout_payload(country_code=country_code, currency=currency)
+    token = str((auth_context or {}).get("token") or "").strip()
+    if not token:
+        return {"success": False, "failure_reason": "Không có access token trong auth_context"}
+
+    _log(log_func, "   🌐 Đang gọi checkout API song song bằng requests-only...")
+    session = requests.Session()
+    for cookie in list((auth_context or {}).get("cookies") or []):
+        name = cookie.get("name")
+        value = cookie.get("value")
+        if name and value is not None:
+            session.cookies.set(name, value, domain=cookie.get("domain"), path=cookie.get("path") or "/")
+
+    resp = session.post(
+        CHECKOUT_API_URL,
+        json=payload,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json",
+            "Origin": "https://chatgpt.com",
+            "Referer": PRICING_URL,
+            "User-Agent": str((auth_context or {}).get("user_agent") or "Mozilla/5.0"),
+        },
+        timeout=DEFAULT_TIMEOUT,
+    )
+
+    try:
+        data = resp.json()
+    except Exception:
+        data = {"raw_text": resp.text[:1000]}
+
+    if resp.ok:
+        result = _normalize_checkout_result(data)
+        if result.get("success"):
+            _log(log_func, "   ✅ Đã lấy được checkout link trial mới từ luồng song song")
+            _log(log_func, f"   🔗 {result['checkout_url']}")
+        return result
 
     return {
         "success": False,

@@ -17,6 +17,7 @@ Chức năng:
 """
 
 import os
+import threading
 import time
 import random
 from contextlib import contextmanager
@@ -44,11 +45,12 @@ from browser import (
     setup_two_factor_auth,
 )
 from checkout_new import create_trial_checkout
+from checkout_new import create_trial_checkout_from_auth_context, extract_checkout_auth_context
 
 
 MAX_PROFILE_RESTARTS = 3
 CHECKOUT_HOME_STABILIZE_SECONDS = 5
-OTP_WAIT_BEFORE_RESEND_SECONDS = 20
+OTP_WAIT_BEFORE_RESEND_SECONDS = 10
 OTP_RESEND_CLICK_TIMES = 2
 SETUP_2FA_ENABLED = True
 DEFAULT_ACCOUNT_PASSWORD = "Chatgpt123456@"
@@ -408,14 +410,65 @@ def register_one_account(
 
         print(f"⏳ Đã vào trang chủ ChatGPT, chờ ổn định {CHECKOUT_HOME_STABILIZE_SECONDS}s trước khi chạy checkout mới...")
         time.sleep(CHECKOUT_HOME_STABILIZE_SECONDS)
-        print("🔗 Đã vào trang chủ ChatGPT, bắt đầu tạo checkout trial mới...")
-        with _timed_stage("get_pay_link"):
-            checkout_result = create_trial_checkout(
-                driver,
-                country_code="ID",
-                currency="IDR",
-                log_func=print,
-            )
+        dismiss_chatgpt_onboarding_if_present(driver, max_rounds=10)
+
+        checkout_result_box = {"result": None}
+        checkout_thread = None
+        checkout_started_parallel = False
+
+        print("🔗 Đang chuẩn bị auth context để thử chạy song song checkout new + bật 2FA...")
+        auth_context = extract_checkout_auth_context(driver, log_func=print)
+        if auth_context.get("token"):
+            def _parallel_checkout_worker():
+                started = time.perf_counter()
+                print("🔗 Luồng nền checkout mới đã bắt đầu...")
+                try:
+                    checkout_result_box["result"] = create_trial_checkout_from_auth_context(
+                        auth_context,
+                        country_code="ID",
+                        currency="IDR",
+                        log_func=print,
+                    )
+                except Exception as e:
+                    checkout_result_box["result"] = {
+                        "success": False,
+                        "failure_reason": f"Lỗi checkout song song: {e}",
+                    }
+                finally:
+                    elapsed = time.perf_counter() - started
+                    timings["get_pay_link"] = round(elapsed, 2)
+                    print(f"⏱️ Khâu get_pay_link mất {elapsed:.2f}s")
+
+            checkout_thread = threading.Thread(target=_parallel_checkout_worker, daemon=True)
+            checkout_thread.start()
+            checkout_started_parallel = True
+        else:
+            print("⚠️ Không lấy được auth context để chạy checkout song song, fallback tuần tự như cũ")
+
+        twofa_result = {"success": False, "reason": "Đã tắt setup 2FA"}
+        if SETUP_2FA_ENABLED:
+            print("🧹 Checkout xong, dọn sạch onboarding/chướng ngại vật trước khi bật 2FA...")
+            dismiss_chatgpt_onboarding_if_present(driver, max_rounds=10)
+            time.sleep(0.5)
+            print("🔐 Bắt đầu setup 2FA trong khi checkout đang xử lý nền...")
+            with _timed_stage("setup_2fa"):
+                twofa_result = setup_two_factor_auth(driver, password, log_func=print)
+
+        if checkout_started_parallel and checkout_thread:
+            checkout_thread.join(timeout=45)
+            checkout_result = checkout_result_box.get("result") or {
+                "success": False,
+                "failure_reason": "Checkout song song không trả kết quả đúng hạn",
+            }
+        else:
+            print("🔗 Đã vào trang chủ ChatGPT, bắt đầu tạo checkout trial mới...")
+            with _timed_stage("get_pay_link"):
+                checkout_result = create_trial_checkout(
+                    driver,
+                    country_code="ID",
+                    currency="IDR",
+                    log_func=print,
+                )
         _report("checkout_link")
 
         email_bundle = _email_context_bundle(email_context)
@@ -440,12 +493,6 @@ def register_one_account(
             print(checkout_url)
 
             if SETUP_2FA_ENABLED:
-                print("🧹 Checkout xong, dọn sạch onboarding/chướng ngại vật trước khi bật 2FA...")
-                dismiss_chatgpt_onboarding_if_present(driver, max_rounds=10)
-                time.sleep(1.5)
-                print("🔐 Checkout mới đã xong, bắt đầu setup 2FA...")
-                with _timed_stage("setup_2fa"):
-                    twofa_result = setup_two_factor_auth(driver, password, log_func=print)
                 if twofa_result.get("success"):
                     secret = str(twofa_result.get("secret") or "").strip()
                     backup_codes = list(twofa_result.get("backup_codes") or [])
