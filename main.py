@@ -16,6 +16,7 @@ Chức năng:
     - Hỗ trợ đăng ký hàng loạt
 """
 
+import os
 import time
 import random
 from contextlib import contextmanager
@@ -35,17 +36,23 @@ from browser import (
     BrowserStartupError,
     click_resend_email_button,
     create_driver,
+    dismiss_chatgpt_onboarding_if_present,
     fill_signup_form,
     enter_verification_code,
     fill_profile_info,
     get_registered_profile_name,
+    setup_two_factor_auth,
 )
 from checkout_new import create_trial_checkout
 
 
 MAX_PROFILE_RESTARTS = 3
 CHECKOUT_HOME_STABILIZE_SECONDS = 5
-OTP_WAIT_BEFORE_RESEND_SECONDS = 40
+OTP_WAIT_BEFORE_RESEND_SECONDS = 20
+OTP_RESEND_CLICK_TIMES = 2
+SETUP_2FA_ENABLED = True
+DEFAULT_ACCOUNT_PASSWORD = "Chatgpt123456@"
+KEEP_PROFILE_OPEN_FOR_DEBUG = str(os.environ.get("KEEP_PROFILE_OPEN_FOR_DEBUG", "1")).strip().lower() in ("1", "true", "yes", "on")
 PROFILE_RESTART_REASON_MARKERS = (
     "Điền form đăng ký thất bại",
     "Không lấy được OTP hợp lệ",
@@ -73,6 +80,22 @@ def _email_context_bundle(email_context):
     if not all(fields):
         return ""
     return "|".join(fields)
+
+
+def _save_twofa_result(email_bundle: str, secret: str, backup_codes: list[str] | None = None) -> None:
+    if not email_bundle or not secret:
+        return
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')}----{email_bundle}----{secret}"
+    if backup_codes:
+        line += f"----{'|'.join(backup_codes)}"
+    line += "\n"
+    file_path = "2fa_secrets.txt"
+    try:
+        with open(file_path, "a", encoding="utf-8") as f:
+            f.write(line)
+        print("✅ Đã lưu secret 2FA vào 2fa_secrets.txt")
+    except Exception as e:
+        print(f"⚠️ Lưu secret 2FA thất bại: {e}")
 
 
 def should_restart_with_new_profile(result: dict[str, Any] | None) -> bool:
@@ -166,6 +189,7 @@ def register_one_account(
     trial_success = False
     no_trial = False
     manual_checkout_ready = False
+    twofa_secret = ""
     timings = {}
     stage_started_at = time.perf_counter()
 
@@ -179,6 +203,7 @@ def register_one_account(
                 "trial_success": trial_success,
                 "no_trial": no_trial,
                 "manual_checkout_ready": manual_checkout_ready,
+                "twofa_secret": twofa_secret,
                 "email_bundle": _email_context_bundle(email_context),
                 "profile_name": get_registered_profile_name(driver) if driver else "",
                 "failure_reason": failure_reason,
@@ -202,6 +227,17 @@ def register_one_account(
             exclude_codes=exclude_codes,
             baseline_message_ids=baseline_message_ids,
         )
+
+    def _resend_otp_twice():
+        clicked = 0
+        for resend_attempt in range(OTP_RESEND_CLICK_TIMES):
+            print(f"📨 Thử bấm Gửi lại email lần {resend_attempt + 1}/{OTP_RESEND_CLICK_TIMES}...")
+            if click_resend_email_button(driver, timeout=8):
+                clicked += 1
+                time.sleep(1.2)
+            else:
+                break
+        return clicked > 0
 
     @contextmanager
     def _timed_stage(stage_name: str):
@@ -240,7 +276,7 @@ def register_one_account(
             return _return_result()
         
         # 3. Tạo mật khẩu ngẫu nhiên
-        password = account_password_override or generate_random_password()
+        password = account_password_override or DEFAULT_ACCOUNT_PASSWORD
         
         # 4. Mở trang đăng ký
         url = "https://chatgpt.com/auth/login"
@@ -261,67 +297,79 @@ def register_one_account(
             failure_reason = "Điền form đăng ký thất bại"
             return _return_result()
         _report("fill_form")
+
+        signup_post_password_state = str(getattr(driver, "signup_post_password_state", "") or "").strip()
+        if signup_post_password_state == "logged_in_no_otp":
+            print("✅ Account đã vào giao diện sau bước mật khẩu, bỏ qua OTP email")
+            otp_accepted = True
+        else:
+            otp_accepted = False
         
         # 6. Chờ email xác minh
         # Mốc này phải đặt ngay sau khi bấm tiếp tục sang màn OTP.
         # Email cũ trước mốc này sẽ bị bỏ qua khi đọc bằng get_messages_oauth2.
         otp_since_ts = time.time()
         used_otp_codes = set()
-        otp_accepted = False
         profile_flow_failures = 0
-        with _timed_stage("otp_total"):
-            for otp_attempt in range(3):
-                with _timed_stage(f"otp_fetch_{otp_attempt + 1}"):
-                    verification_code = _wait_verification_code(
-                        email_context,
-                        timeout=OTP_WAIT_BEFORE_RESEND_SECONDS,
-                        since_ts=otp_since_ts,
-                        exclude_codes=used_otp_codes,
-                        baseline_message_ids=baseline_message_ids,
-                    )
+        if not otp_accepted:
+            with _timed_stage("otp_total"):
+                for otp_attempt in range(3):
+                    with _timed_stage(f"otp_fetch_{otp_attempt + 1}"):
+                        verification_code = _wait_verification_code(
+                            email_context,
+                            timeout=OTP_WAIT_BEFORE_RESEND_SECONDS,
+                            since_ts=otp_since_ts,
+                            exclude_codes=used_otp_codes,
+                            baseline_message_ids=baseline_message_ids,
+                        )
 
-                if not verification_code:
-                    print(f"⚠️ Quá {OTP_WAIT_BEFORE_RESEND_SECONDS}s vẫn chưa có OTP, thử bấm Gửi lại email...")
-                    if click_resend_email_button(driver, timeout=8):
-                        otp_since_ts = time.time()
-                        time.sleep(1.5)
-                        continue
-                    print("⚠️ Không bấm được Gửi lại email, dừng chờ OTP ở profile này")
-                    break
+                    if not verification_code:
+                        print(f"⚠️ Quá {OTP_WAIT_BEFORE_RESEND_SECONDS}s vẫn chưa có OTP, thử bấm Gửi lại email...")
+                        if _resend_otp_twice():
+                            otp_since_ts = time.time()
+                            time.sleep(1.5)
+                            continue
+                        print("⚠️ Không bấm được Gửi lại email, dừng chờ OTP ở profile này")
+                        break
 
-                with _timed_stage(f"otp_submit_{otp_attempt + 1}"):
-                    otp_result = enter_verification_code(driver, verification_code)
-                if otp_result == "accepted":
-                    otp_accepted = True
-                    break
-                if otp_result == "retry":
-                    used_otp_codes.add(verification_code)
-                    profile_flow_failures += 1
-                if otp_result == "inline_retry":
-                    profile_flow_failures += 1
-                    if profile_flow_failures >= 2:
-                        print("❌ Form inline mail/OTP/tên/tuổi lỗi 2 lần, chuyển profile mới")
-                        failure_reason = "Form inline lỗi 2 lần, chuyển profile mới"
+                    with _timed_stage(f"otp_submit_{otp_attempt + 1}"):
+                        otp_result = enter_verification_code(driver, verification_code)
+                    if otp_result == "accepted":
+                        otp_accepted = True
+                        break
+                    if otp_result == "retry":
+                        used_otp_codes.add(verification_code)
+                        profile_flow_failures += 1
+                        print("⚠️ OTP sai hoặc chưa chuyển trang kịp, sẽ gửi lại email và lấy OTP mới...")
+                        if _resend_otp_twice():
+                            otp_since_ts = time.time()
+                    if otp_result == "inline_retry":
+                        used_otp_codes.add(verification_code)
+                        profile_flow_failures += 1
+                        print("⚠️ OTP chưa qua ở form inline, sẽ gửi lại email và lấy OTP mới...")
+                        if _resend_otp_twice():
+                            otp_since_ts = time.time()
+                        if profile_flow_failures >= 2:
+                            print("❌ Form inline mail/OTP/tên/tuổi lỗi 2 lần, chuyển profile mới")
+                            failure_reason = "Form inline lỗi 2 lần, chuyển profile mới"
+                            return _return_result()
+                    if otp_result == "profile_error":
+                        profile_flow_failures += 1
+                        if profile_flow_failures >= 2:
+                            print("❌ Trang lỗi sau OTP 2 lần trong cùng profile, chuyển profile mới")
+                            failure_reason = "Trang lỗi sau OTP 2 lần, chuyển profile mới"
+                            return _return_result()
+                    if otp_result == "failed":
+                        print("❌ Nhập mã xác minh thất bại")
+                        failure_reason = "Nhập mã xác minh thất bại"
                         return _return_result()
-                if otp_result == "profile_error":
-                    profile_flow_failures += 1
+
                     if profile_flow_failures >= 2:
-                        print("❌ Trang lỗi sau OTP 2 lần trong cùng profile, chuyển profile mới")
-                        failure_reason = "Trang lỗi sau OTP 2 lần, chuyển profile mới"
+                        print("❌ Profile lỗi lặp quá 2 lần, chuyển profile mới")
+                        failure_reason = "Profile lỗi lặp quá 2 lần"
                         return _return_result()
-                if otp_result == "failed":
-                    print("❌ Nhập mã xác minh thất bại")
-                    failure_reason = "Nhập mã xác minh thất bại"
-                    return _return_result()
 
-                if profile_flow_failures >= 2:
-                    print("❌ Profile lỗi lặp quá 2 lần, chuyển profile mới")
-                    failure_reason = "Profile lỗi lặp quá 2 lần"
-                    return _return_result()
-
-                print(f"🔁 OTP/form chưa được chấp nhận, lấy lại OTP mới ({otp_attempt + 2}/3)...")
-                if otp_result == "retry":
-                    otp_since_ts = time.time()
+                    print(f"🔁 OTP/form chưa được chấp nhận, lấy lại OTP mới ({otp_attempt + 2}/3)...")
 
         if not otp_accepted:
             print("❌ Không lấy được OTP hợp lệ, dừng đăng ký")
@@ -390,6 +438,28 @@ def register_one_account(
             print("✅ Đã hoàn tất luồng checkout mới")
             print("✅ Output checkout trial:")
             print(checkout_url)
+
+            if SETUP_2FA_ENABLED:
+                print("🧹 Checkout xong, dọn sạch onboarding/chướng ngại vật trước khi bật 2FA...")
+                dismiss_chatgpt_onboarding_if_present(driver, max_rounds=10)
+                time.sleep(1.5)
+                print("🔐 Checkout mới đã xong, bắt đầu setup 2FA...")
+                with _timed_stage("setup_2fa"):
+                    twofa_result = setup_two_factor_auth(driver, password, log_func=print)
+                if twofa_result.get("success"):
+                    secret = str(twofa_result.get("secret") or "").strip()
+                    backup_codes = list(twofa_result.get("backup_codes") or [])
+                    verified = bool(twofa_result.get("verified", True))
+                    if secret:
+                        twofa_secret = secret
+                        _save_twofa_result(email_bundle, secret, backup_codes)
+                    if verified:
+                        print("✅ Đã hoàn tất setup 2FA sau checkout")
+                    else:
+                        print("🧪 Đã lấy được secret 2FA và dừng ở bước manual secret để debug")
+                else:
+                    print(f"⚠️ Setup 2FA thất bại nhưng vẫn giữ kết quả checkout: {twofa_result.get('reason')}")
+                _report("setup_2fa")
         else:
             update_account_status(
                 email,
@@ -422,9 +492,11 @@ def register_one_account(
         total_elapsed = time.perf_counter() - stage_started_at
         timings["total"] = round(total_elapsed, 2)
         print(f"⏱️ Tổng thời gian account: {total_elapsed:.2f}s")
-        if driver and not manual_checkout_ready:
+        if driver and not manual_checkout_ready and not KEEP_PROFILE_OPEN_FOR_DEBUG:
             print("🔒 Đang đóng trình duyệt...")
             driver.quit()
+        elif driver and KEEP_PROFILE_OPEN_FOR_DEBUG:
+            print("🧪 Debug mode: giữ nguyên profile/trình duyệt để kiểm tra, không tự đóng")
         if mark_result and email_context and browser_ready and not stopped:
             mark_account_result(email_context, success, failure_reason)
     

@@ -46,6 +46,8 @@ MAX_ADMIN_PARALLEL = 4
 MAX_GLOBAL_BROWSERS = 4
 DEFAULT_USER_CREDITS = 1
 JOB_STALL_TIMEOUT = int(os.environ.get("TELEGRAM_JOB_STALL_TIMEOUT", "240"))
+REGGET_SINGLE_WINDOW_WIDTH = int(os.environ.get("REGGET_SINGLE_WINDOW_WIDTH", "1500"))
+REGGET_SINGLE_WINDOW_HEIGHT = int(os.environ.get("REGGET_SINGLE_WINDOW_HEIGHT", "980"))
 
 _state_lock = threading.Lock()
 _user_locks: dict[int, threading.Lock] = {}
@@ -589,6 +591,13 @@ def _bundle(account: Any) -> str:
     return email
 
 
+def _result_bundle(result: dict[str, Any], account: Any) -> str:
+    email = str(result.get("email") or getattr(account, "email", "") or "").strip()
+    password = str(result.get("password") or getattr(account, "password", "") or "").strip()
+    twofa_secret = str(result.get("twofa_secret") or "").strip()
+    return "|".join((email, password, twofa_secret))
+
+
 def _format_timings(result: dict[str, Any]) -> str:
     timings = result.get("timings") or {}
     if not isinstance(timings, dict) or not timings:
@@ -602,6 +611,7 @@ def _format_timings(result: dict[str, Any]) -> str:
         "fill_profile_info",
         "trial_free",
         "get_pay_link",
+        "setup_2fa",
         "total",
     )
     parts = []
@@ -614,27 +624,22 @@ def _format_timings(result: dict[str, Any]) -> str:
 
 def _format_account_result(account: HotmailAccount, result: dict[str, Any], remaining_credit: int | None = None) -> str:
     pay_link = str(result.get("checkout_url") or "").strip()
-    profile_name = str(result.get("profile_name") or "").strip()
-    timing_text = _format_timings(result)
     reason = str(result.get("failure_reason") or "Thất bại")
-    profile_suffix = f"\nTên đã đặt: {profile_name}" if profile_name else ""
-    timing_suffix = f"\nThời gian: {timing_text}" if timing_text else ""
-    credit_suffix = f"\nCredit còn lại: {remaining_credit}" if remaining_credit is not None else ""
 
     if result.get("success") and result.get("manual_checkout_ready"):
-        return f"MANUAL_CHECKOUT\n{_bundle(account)}----Đã mở trang checkout, giữ trình duyệt để thanh toán tay{profile_suffix}{timing_suffix}{credit_suffix}"
+        return f"MANUAL_CHECKOUT\n{_result_bundle(result, account)}\nĐã mở trang checkout, giữ trình duyệt để thanh toán tay"
     if result.get("success") and pay_link:
-        return f"✅ Checkout\n📦 {_bundle(account)}\n🔗 {pay_link}"
+        return f"{_result_bundle(result, account)}\n{pay_link}"
     if result.get("success") and result.get("trial_success"):
-        return f"TRIAL_FREE\n{_bundle(account)}----Đã tạo tài khoản và chạy trial_free thành công{profile_suffix}{timing_suffix}{credit_suffix}"
+        return f"TRIAL_FREE\n{_result_bundle(result, account)}\nĐã tạo tài khoản và chạy trial_free thành công"
     if result.get("success") and result.get("no_trial"):
-        return f"NO_TRIAL\n{_bundle(account)}----Đã tạo tài khoản nhưng account không có trial{profile_suffix}{timing_suffix}{credit_suffix}"
+        return f"NO_TRIAL\n{_result_bundle(result, account)}\nĐã tạo tài khoản nhưng account không có trial"
     if result.get("success") and reason and reason not in {"Đăng ký thất bại", "Thất bại"}:
-        return f"FAIL\n{_bundle(account)}----{reason}{profile_suffix}{timing_suffix}{credit_suffix}"
+        return f"FAIL\n{_result_bundle(result, account)}\n{reason}"
     if result.get("success"):
-        return f"REGISTERED\n{_bundle(account)}----Đã tạo tài khoản thành công, chưa chạy trial thành công{profile_suffix}{timing_suffix}{credit_suffix}"
+        return f"REGISTERED\n{_result_bundle(result, account)}\nĐã tạo tài khoản thành công, chưa chạy trial thành công"
 
-    return f"FAIL\n{_bundle(account)}----{reason}{profile_suffix}{timing_suffix}{credit_suffix}"
+    return f"FAIL\n{_result_bundle(result, account)}\n{reason}"
 
 
 def _finish_one_account(
@@ -689,6 +694,7 @@ def _run_one_account(
                     "fill_profile": (85, "Đã hoàn tất hồ sơ"),
                     "registered": (92, "Đang chạy trial"),
                     "checkout_link": (95, "Đang lấy link pay"),
+                    "setup_2fa": (98, "Đang bật 2FA"),
                 }
                 if step in stage_map:
                     percent, stage = stage_map[step]
@@ -737,8 +743,8 @@ def _notify_admins_regget_done(
             status = "MANUAL_CHECKOUT"
             output = "Đã mở trang checkout, giữ trình duyệt để thanh toán tay"
         elif result.get("success") and pay_link:
-            status = "✅ Checkout"
-            output = f"📦 {_bundle(account)}\n🔗 {pay_link}"
+            status = "SUCCESS"
+            output = f"{_result_bundle(result, account)}\n{pay_link}"
         elif result.get("success") and result.get("trial_success"):
             status = "TRIAL_FREE"
             output = "Đã tạo tài khoản và chạy trial_free thành công"
@@ -821,6 +827,19 @@ def _run_regget_job(
         progress.set(1, "Đã nhận lệnh")
         _log(f"{_user_label(user_id, username)} bắt đầu /regget với {len(accounts)} cụm mail")
         results: list[tuple[Any, dict[str, Any]]] = []
+        single_account_large_window = len(accounts) == 1
+        if single_account_large_window:
+            browser.set_visible_grid_override(
+                cols=1,
+                rows=1,
+                width=REGGET_SINGLE_WINDOW_WIDTH,
+                height=REGGET_SINGLE_WINDOW_HEIGHT,
+            )
+            browser.set_profile_zoom_override(1.0)
+            progress.log(
+                f"Chỉ có 1 mail, mở trình duyệt kích thước lớn {REGGET_SINGLE_WINDOW_WIDTH}x{REGGET_SINGLE_WINDOW_HEIGHT} để debug 2FA",
+                force=True,
+            )
 
         if is_admin and len(accounts) > 1:
             with ThreadPoolExecutor(max_workers=min(MAX_ADMIN_PARALLEL, len(accounts))) as executor:
@@ -865,6 +884,11 @@ def _run_regget_job(
                     pass
         progress.flush()
     finally:
+        try:
+            browser.set_visible_grid_override()
+            browser.set_profile_zoom_override()
+        except Exception:
+            pass
         if "done_event" in locals():
             done_event.set()
         slot.release()

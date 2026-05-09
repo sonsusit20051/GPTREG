@@ -10,6 +10,10 @@ import random
 import subprocess
 import threading
 import time
+import base64
+import hashlib
+import hmac
+import struct
 import undetected_chromedriver as uc
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -64,6 +68,7 @@ _visible_window_slot_index = 0
 _visible_grid_override = None
 _profile_zoom_override = None
 HOME_READY_STABLE_SECONDS = 5
+OTP_POST_SUBMIT_TRANSITION_TIMEOUT = 10
 
 
 class BrowserStartupError(RuntimeError):
@@ -1473,6 +1478,9 @@ def classify_after_email_continue(driver):
     if "chatgpt.com/auth/error" in lowered_url and "oauthcallback" in lowered_url:
         return "auth_oauth_error", current_url
 
+    if _find_continue_with_password_candidates(driver):
+        return "password_switch", ""
+
     if "email-verification/register" in current_url:
         code_input = find_code_input_fast(driver, timeout=0.2)
         inline_form_detected = bool(
@@ -1519,6 +1527,57 @@ def classify_after_email_continue(driver):
         return "loading", ready_state
 
     return "unknown", current_url
+
+
+def _find_continue_with_password_candidates(driver):
+    selectors = [
+        (By.XPATH, '//button[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZÀÁẠẢÃĂẮẰẲẴẶÂẤẦẨẪẬĐÈÉẸẺẼÊẾỀỂỄỆÌÍỊỈĨÒÓỌỎÕÔỐỒỔỖỘƠỚỜỞỠỢÙÚỤỦŨƯỨỪỬỮỰỲÝỴỶỸ", "abcdefghijklmnopqrstuvwxyzàáạảãăắằẳẵặâấầẩẫậđèéẹẻẽêếềểễệìíịỉĩòóọỏõôốồổỗộơớờởỡợùúụủũưứừửữựỳýỵỷỹ"), "tiếp tục với mật khẩu")]'),
+        (By.XPATH, '//button[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "continue with password")]'),
+        (By.XPATH, '//button[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "password instead")]'),
+        (By.XPATH, '//a[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZÀÁẠẢÃĂẮẰẲẴẶÂẤẦẨẪẬĐÈÉẸẺẼÊẾỀỂỄỆÌÍỊỈĨÒÓỌỎÕÔỐỒỔỖỘƠỚỜỞỠỢÙÚỤỦŨƯỨỪỬỮỰỲÝỴỶỸ", "abcdefghijklmnopqrstuvwxyzàáạảãăắằẳẵặâấầẩẫậđèéẹẻẽêếềểễệìíịỉĩòóọỏõôốồổỗộơớờởỡợùúụủũưứừửữựỳýỵỷỹ"), "tiếp tục với mật khẩu")]'),
+        (By.XPATH, '//a[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "continue with password")]'),
+    ]
+    candidates = []
+    for by, selector in selectors:
+        try:
+            candidates.extend(driver.find_elements(by, selector))
+        except Exception:
+            continue
+
+    visible = []
+    for candidate in candidates:
+        try:
+            if candidate.is_displayed() and candidate.is_enabled():
+                visible.append(candidate)
+        except Exception:
+            continue
+    return visible
+
+
+def click_continue_with_password(driver, timeout=8):
+    """Ưu tiên chuyển về flow password trước khi điền OTP nếu UI cho phép."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        candidates = _find_continue_with_password_candidates(driver)
+        if not candidates:
+            time.sleep(0.25)
+            continue
+
+        for candidate in candidates:
+            try:
+                scroll_element_and_ancestors_into_view(driver, candidate)
+                try:
+                    candidate.click()
+                except Exception:
+                    driver.execute_script("arguments[0].click();", candidate)
+                print("✅ Đã bấm 'Tiếp tục với mật khẩu'")
+                return True
+            except Exception:
+                continue
+        time.sleep(0.25)
+
+    print("⚠️ Không bấm được nút 'Tiếp tục với mật khẩu'")
+    return False
 
 
 def robust_fill_input(driver, element, value, label="input"):
@@ -1586,6 +1645,7 @@ def fill_birthdate_ddmmyyyy_input(driver, element, value):
                 element.send_keys(Keys.COMMAND, "a")
                 time.sleep(0.05)
                 element.send_keys(Keys.BACKSPACE)
+                element.send_keys(Keys.DELETE)
                 time.sleep(0.08)
 
                 current_value = read_current_value()
@@ -1595,6 +1655,7 @@ def fill_birthdate_ddmmyyyy_input(driver, element, value):
                     time.sleep(0.03)
                     for _ in range(backspace_count):
                         element.send_keys(Keys.BACKSPACE)
+                        element.send_keys(Keys.DELETE)
                         time.sleep(0.01)
                     time.sleep(0.08)
         except Exception:
@@ -1607,6 +1668,16 @@ def fill_birthdate_ddmmyyyy_input(driver, element, value):
                     """
                     const el = arguments[0];
                     el.focus();
+                    try {
+                      if (typeof el.setSelectionRange === 'function') {
+                        el.setSelectionRange(0, (el.value || '').length);
+                      }
+                    } catch (_err) {}
+                    try {
+                      if (typeof el.setRangeText === 'function') {
+                        el.setRangeText('', 0, (el.value || '').length, 'end');
+                      }
+                    } catch (_err) {}
                     const setter = Object.getOwnPropertyDescriptor(el.__proto__, 'value')?.set;
                     if (setter) {
                         setter.call(el, '');
@@ -1634,6 +1705,11 @@ def fill_birthdate_ddmmyyyy_input(driver, element, value):
         time.sleep(0.08)
         clear_birthdate_field()
         time.sleep(0.05)
+        try:
+            element.send_keys(Keys.COMMAND, "a")
+            time.sleep(0.03)
+        except Exception:
+            pass
         for char in expected:
             element.send_keys(char)
             time.sleep(0.03 if char == "/" else 0.02)
@@ -1944,6 +2020,1022 @@ def wait_for_chatgpt_home_ready(driver, timeout=120):
     return False
 
 
+def _normalize_2fa_secret(secret: str) -> str:
+    return re.sub(r"[^A-Z2-7]", "", str(secret or "").upper())
+
+
+def _generate_totp_code(secret: str, digits: int = 6, interval: int = 30) -> str:
+    normalized = _normalize_2fa_secret(secret)
+    key = base64.b32decode(normalized, casefold=True)
+    counter = int(time.time() // interval)
+    return _generate_totp_code_at_counter(key, counter, digits=digits)
+
+
+def _generate_totp_code_at_counter(key: bytes, counter: int, digits: int = 6) -> str:
+    counter_bytes = struct.pack(">Q", counter)
+    digest = hmac.new(key, counter_bytes, hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    binary = struct.unpack(">I", digest[offset:offset + 4])[0] & 0x7FFFFFFF
+    return str(binary % (10 ** digits)).zfill(digits)
+
+
+def _generate_totp_code_at(secret: str, timestamp: int, digits: int = 6, interval: int = 30) -> str:
+    normalized = _normalize_2fa_secret(secret)
+    key = base64.b32decode(normalized, casefold=True)
+    counter = int(timestamp // interval)
+    return _generate_totp_code_at_counter(key, counter, digits=digits)
+
+
+def _extract_2fa_secret_from_page(driver):
+    candidates = []
+    try:
+        body_text = driver.find_element(By.TAG_NAME, "body").text or ""
+        candidates.append(body_text)
+    except Exception:
+        pass
+
+    try:
+        candidates.append(driver.page_source or "")
+    except Exception:
+        pass
+
+    try:
+        qr_nodes = driver.find_elements(By.CSS_SELECTOR, 'img, canvas, [data-testid*="qr"], [src*="otpauth"], [href*="otpauth"]')
+        for node in qr_nodes:
+            for attr in ("src", "href", "data-qr", "data-url"):
+                try:
+                    value = node.get_attribute(attr) or ""
+                    if value:
+                        candidates.append(value)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        otpauth_match = re.search(r"secret=([A-Z2-7]{16,64})", candidate, re.IGNORECASE)
+        if otpauth_match:
+            return _normalize_2fa_secret(otpauth_match.group(1))
+
+        labeled_match = re.search(r"secret\s*key[^A-Z2-7]*([A-Z2-7][A-Z2-7\s-]{15,80})", candidate, re.IGNORECASE)
+        if labeled_match:
+            secret = _normalize_2fa_secret(labeled_match.group(1))
+            if len(secret) >= 16:
+                return secret
+
+        generic_match = re.search(r"\b([A-Z2-7]{32})\b", candidate)
+        if generic_match:
+            return _normalize_2fa_secret(generic_match.group(1))
+
+    return ""
+
+
+def _collect_2fa_backup_codes(driver):
+    try:
+        body_text = driver.find_element(By.TAG_NAME, "body").text or ""
+    except Exception:
+        return []
+
+    codes = []
+    for line in body_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        match = re.fullmatch(r"[A-Z0-9-]{6,20}", line, re.IGNORECASE)
+        if match and not line.lower().startswith(("chatgpt", "security", "backup")):
+            codes.append(line)
+    deduped = []
+    for code in codes:
+        if code not in deduped:
+            deduped.append(code)
+    return deduped[:20]
+
+
+def _click_manual_2fa_secret_link(driver):
+    selectors = [
+        (By.XPATH, '//*[self::a or self::button or self::span][contains(normalize-space(.), "Bạn gặp vấn đề khi quét")]'),
+        (By.XPATH, '//*[self::a or self::button or self::span][contains(normalize-space(.), "Trouble scanning")]'),
+        (By.XPATH, '//*[self::a or self::button or self::span][contains(normalize-space(.), "Can\'t scan")]'),
+    ]
+    for by, selector in selectors:
+        try:
+            nodes = driver.find_elements(by, selector)
+        except Exception:
+            nodes = []
+        for node in nodes:
+            try:
+                if not node.is_displayed():
+                    continue
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", node)
+                try:
+                    node.click()
+                except Exception:
+                    driver.execute_script("arguments[0].click();", node)
+                time.sleep(0.35)
+                return True
+            except Exception:
+                continue
+
+    try:
+        clicked = driver.execute_script(
+            """
+            const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+            const nodes = Array.from(document.querySelectorAll('a, button, span'));
+            for (const node of nodes) {
+                if (!node || node.offsetParent === null) continue;
+                const text = norm(node.innerText || node.textContent || node.getAttribute('aria-label') || '');
+                if (
+                    text.includes('bạn gặp vấn đề khi quét') ||
+                    text.includes('trouble scanning') ||
+                    text.includes("can't scan")
+                ) {
+                    try {
+                        node.scrollIntoView({ block: 'center', behavior: 'instant' });
+                        node.click();
+                        return true;
+                    } catch (_err) {}
+                }
+            }
+            return false;
+            """
+        )
+        if clicked:
+            time.sleep(0.35)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _click_2fa_verify_button(driver):
+    try:
+        clicked = driver.execute_script(
+            """
+            const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+            const dialogs = Array.from(document.querySelectorAll('[role="dialog"]')).filter((el) => el && el.offsetParent !== null);
+            const root = dialogs.length ? dialogs[dialogs.length - 1] : document;
+            const buttons = Array.from(root.querySelectorAll('button, [role="button"]')).filter((el) => el && el.offsetParent !== null);
+
+            for (const button of buttons) {
+                const text = norm(button.innerText || button.textContent || button.getAttribute('aria-label') || '');
+                if (!text) continue;
+                if (text.includes('xác minh') || text.includes('verify')) {
+                    try {
+                        button.click();
+                        return true;
+                    } catch (_err) {}
+                }
+            }
+
+            const submit = root.querySelector('button[type="submit"]');
+            if (submit && submit.offsetParent !== null) {
+                try {
+                    submit.click();
+                    return true;
+                } catch (_err) {}
+            }
+            return false;
+            """
+        )
+        if clicked:
+            return True
+    except Exception:
+        pass
+
+    xpaths = [
+        '//button[contains(normalize-space(.), "Xác minh")]',
+        '//button[contains(normalize-space(.), "Verify")]',
+        '//button[@type="submit"]',
+    ]
+    for xpath in xpaths:
+        try:
+            nodes = driver.find_elements(By.XPATH, xpath)
+        except Exception:
+            nodes = []
+        for node in nodes:
+            try:
+                if not node.is_displayed() or not node.is_enabled():
+                    continue
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", node)
+                try:
+                    node.click()
+                except Exception:
+                    driver.execute_script("arguments[0].click();", node)
+                return True
+            except Exception:
+                continue
+
+    try:
+        clicked = driver.execute_script(
+            """
+            const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+            const buttons = Array.from(document.querySelectorAll('button, [role="button"]'));
+            for (const button of buttons) {
+                if (!button || button.offsetParent === null) continue;
+                const text = norm(button.innerText || button.textContent || button.getAttribute('aria-label') || '');
+                if (text.includes('xác minh') || text.includes('verify')) {
+                    try {
+                        button.scrollIntoView({ block: 'center', behavior: 'instant' });
+                        button.click();
+                        return true;
+                    } catch (_err) {}
+                }
+            }
+            const submit = document.querySelector('button[type="submit"]');
+            if (submit && submit.offsetParent !== null) {
+                try {
+                    submit.scrollIntoView({ block: 'center', behavior: 'instant' });
+                    submit.click();
+                    return true;
+                } catch (_err) {}
+            }
+            return false;
+            """
+        )
+        if clicked:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _wait_until(timeout_seconds, predicate, interval=0.2):
+    deadline = time.time() + max(0.1, float(timeout_seconds))
+    while time.time() < deadline:
+        try:
+            value = predicate()
+            if value:
+                return value
+        except Exception:
+            pass
+        time.sleep(interval)
+    return None
+
+
+def _wait_for_2fa_dialog_progress(driver, timeout_seconds=4.0):
+    def _probe():
+        try:
+            body_text = (driver.find_element(By.TAG_NAME, "body").text or "").lower()
+        except Exception:
+            body_text = ""
+        if any(token in body_text for token in ("failed to verify", "thử lại", "mã không hợp lệ", "try again")):
+            return "invalid"
+        if any(token in body_text for token in ("backup", "mã dự phòng", "i have saved", "đã lưu", "done", "xong")):
+            return "verified"
+        return None
+
+    return _wait_until(timeout_seconds, _probe, interval=0.2)
+
+
+def setup_two_factor_auth(driver, password: str, log_func=None):
+    """Best-effort bật 2FA cho ChatGPT sau khi checkout mới đã xong."""
+    if log_func is None:
+        log_func = print
+
+    log_func("   🔐 Bắt đầu setup 2FA...")
+    try:
+        def is_security_panel_open():
+            try:
+                current_url = (driver.current_url or "").lower()
+            except Exception:
+                current_url = ""
+            if "#settings/security" in current_url or "/settings/security" in current_url:
+                return True
+
+            try:
+                body_text = (driver.find_element(By.TAG_NAME, "body").text or "").lower()
+            except Exception:
+                body_text = ""
+            keywords = (
+                "security",
+                "bảo mật",
+                "two-factor authentication",
+                "authenticator app",
+                "xác thực hai yếu tố",
+                "ứng dụng xác thực",
+            )
+            if any(keyword in body_text for keyword in keywords):
+                return True
+
+            try:
+                return bool(driver.execute_script(
+                    """
+                    const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                    const dialogs = Array.from(document.querySelectorAll('[role="dialog"], [data-radix-popper-content-wrapper] [role="dialog"]'));
+                    const surfaces = dialogs.length ? dialogs : [document.body];
+                    const wanted = ['security', 'bảo mật', 'authenticator app', 'ứng dụng xác thực', 'two-factor authentication'];
+                    for (const surface of surfaces) {
+                        const text = norm(surface.innerText || surface.textContent || '');
+                        if (wanted.some((item) => text.includes(item))) return true;
+                        const selectedTab = surface.querySelector('[role="tab"][aria-selected="true"], button[data-state="active"], [data-state="active"][role="button"]');
+                        const selectedText = norm(selectedTab && (selectedTab.innerText || selectedTab.textContent || selectedTab.getAttribute('aria-label') || ''));
+                        if (selectedText.includes('security') || selectedText.includes('bảo mật')) return true;
+                    }
+                    return false;
+                    """
+                ))
+            except Exception:
+                return False
+
+        def open_sidebar_if_needed():
+            selectors = [
+                (By.XPATH, '//*[self::button or @role="button"][@aria-label="Open sidebar" or @aria-label="Mở sidebar"]'),
+                (By.XPATH, '//*[self::button or @role="button"][contains(normalize-space(.), "Open sidebar") or contains(normalize-space(.), "Mở sidebar")]'),
+            ]
+            for by, selector in selectors:
+                try:
+                    nodes = driver.find_elements(by, selector)
+                except Exception:
+                    nodes = []
+                for node in nodes:
+                    try:
+                        if not node.is_displayed() or not node.is_enabled():
+                            continue
+                        try:
+                            node.click()
+                        except Exception:
+                            driver.execute_script("arguments[0].click();", node)
+                        time.sleep(1)
+                        log_func("   ✅ Đã mở sidebar")
+                        return True
+                    except Exception:
+                        continue
+            return False
+
+        def click_settings_entry():
+            xpaths = [
+                '//*[self::button or self::div or self::a or @role="menuitem" or @role="button"][contains(normalize-space(.), "Settings") or contains(normalize-space(.), "Cài đặt")]',
+                '//div[@role="menu"]//*[contains(normalize-space(.), "Settings") or contains(normalize-space(.), "Cài đặt")]',
+            ]
+            for xpath in xpaths:
+                try:
+                    nodes = driver.find_elements(By.XPATH, xpath)
+                except Exception:
+                    nodes = []
+                for node in nodes:
+                    try:
+                        if not node.is_displayed():
+                            continue
+                        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", node)
+                        try:
+                            node.click()
+                        except Exception:
+                            driver.execute_script("arguments[0].click();", node)
+                        time.sleep(2)
+                        log_func("   ✅ Đã mở Settings / Cài đặt")
+                        return True
+                    except Exception:
+                        continue
+            try:
+                clicked = driver.execute_script(
+                    """
+                    const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                    const nodes = Array.from(document.querySelectorAll('button, [role="button"], [role="menuitem"], a, div'));
+                    for (const node of nodes) {
+                        if (!node || node.offsetParent === null) continue;
+                        const text = norm(node.innerText || node.textContent || node.getAttribute('aria-label') || '');
+                        if (!text || (!text.includes('settings') && !text.includes('cài đặt'))) continue;
+                        try {
+                            node.scrollIntoView({ block: 'center', behavior: 'instant' });
+                            node.click();
+                            return true;
+                        } catch (_err) {}
+                    }
+                    return false;
+                    """
+                )
+                if clicked:
+                    time.sleep(2)
+                    log_func("   ✅ Đã mở Settings / Cài đặt bằng JS")
+                    return True
+            except Exception:
+                pass
+            return False
+
+        def click_security_entry():
+            xpaths = [
+                '//*[self::button or self::div or self::a or @role="tab" or @role="button"][contains(normalize-space(.), "Security") or contains(normalize-space(.), "Bảo mật")]',
+                '//div[@role="dialog"]//*[self::button or self::div or self::a or @role="tab" or @role="button"][contains(normalize-space(.), "Security") or contains(normalize-space(.), "Bảo mật")]',
+            ]
+            for xpath in xpaths:
+                try:
+                    nodes = driver.find_elements(By.XPATH, xpath)
+                except Exception:
+                    nodes = []
+                for node in nodes:
+                    try:
+                        if not node.is_displayed():
+                            continue
+                        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", node)
+                        try:
+                            node.click()
+                        except Exception:
+                            driver.execute_script("arguments[0].click();", node)
+                        time.sleep(2)
+                        log_func("   ✅ Đã click tab Security / Bảo mật")
+                        return True
+                    except Exception:
+                        continue
+            try:
+                clicked = driver.execute_script(
+                    """
+                    const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                    const nodes = Array.from(document.querySelectorAll('[role="dialog"] button, [role="dialog"] [role="button"], [role="dialog"] [role="tab"], button, [role="button"], [role="tab"], a, div'));
+                    for (const node of nodes) {
+                        if (!node || node.offsetParent === null) continue;
+                        const text = norm(node.innerText || node.textContent || node.getAttribute('aria-label') || '');
+                        if (!text || (!text.includes('security') && !text.includes('bảo mật'))) continue;
+                        try {
+                            node.scrollIntoView({ block: 'center', behavior: 'instant' });
+                            node.click();
+                            return true;
+                        } catch (_err) {}
+                    }
+                    return false;
+                    """
+                )
+                if clicked:
+                    time.sleep(2)
+                    log_func("   ✅ Đã click tab Security / Bảo mật bằng JS")
+                    return True
+            except Exception:
+                pass
+            return False
+
+        def click_profile_menu():
+            js = """
+                const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                const candidates = Array.from(document.querySelectorAll('button, [role="button"], [role="menuitem"], a'));
+                for (const el of candidates) {
+                    if (!el || el.offsetParent === null) continue;
+                    const text = norm(el.innerText || el.textContent || el.getAttribute('aria-label') || '');
+                    const attrs = norm(
+                        (el.getAttribute('data-testid') || '') + ' ' +
+                        (el.getAttribute('aria-label') || '') + ' ' +
+                        (el.getAttribute('title') || '')
+                    );
+                    if (
+                        attrs.includes('user-menu') ||
+                        attrs.includes('account-menu') ||
+                        attrs.includes('profile-menu') ||
+                        text === '...' ||
+                        text.includes('settings') ||
+                        text.includes('cài đặt')
+                    ) {
+                        try { el.click(); return true; } catch (_err) {}
+                    }
+                }
+                return false;
+            """
+            try:
+                if driver.execute_script(js):
+                    time.sleep(1.5)
+                    log_func("   ✅ Đã thử mở menu tài khoản")
+                    return True
+            except Exception:
+                pass
+            return False
+
+        def open_security_settings():
+            if is_security_panel_open():
+                log_func("   ✅ Popup/tab Security đã mở sẵn, không mở lại")
+                return True
+
+            security_url = "https://chatgpt.com/#settings/Security"
+            attempts = [
+                ("direct_get", lambda: driver.get(security_url)),
+                ("assign_hash", lambda: driver.execute_script("window.location.href = arguments[0];", security_url)),
+                ("replace_hash", lambda: driver.execute_script("window.location.hash = '#settings/Security'; window.dispatchEvent(new HashChangeEvent('hashchange'));")),
+            ]
+            for method_name, action in attempts:
+                try:
+                    action()
+                except Exception:
+                    continue
+                time.sleep(3)
+                dismiss_chatgpt_onboarding_if_present(driver, max_rounds=2)
+                if is_security_panel_open():
+                    log_func(f"   ✅ Đã vào được Security bằng cách {method_name}")
+                    return True
+
+            open_sidebar_if_needed()
+            click_profile_menu()
+            if click_settings_entry():
+                dismiss_chatgpt_onboarding_if_present(driver, max_rounds=2)
+                click_security_entry()
+                if is_security_panel_open():
+                    log_func("   ✅ Settings đã mở, chuẩn bị chuyển sang Security")
+                    return True
+
+            return False
+
+        def scroll_security_dialog(step=900, rounds=1):
+            for _ in range(max(1, int(rounds))):
+                try:
+                    driver.execute_script(
+                        """
+                        const step = arguments[0];
+                        const targets = [
+                          document.querySelector('[role="dialog"] [data-radix-scroll-area-viewport]'),
+                          document.querySelector('[role="dialog"] [class*="scroll"]'),
+                          document.querySelector('[role="dialog"] [class*="overflow"]'),
+                          document.querySelector('[role="dialog"]'),
+                          document.querySelector('main'),
+                          document.scrollingElement || document.documentElement,
+                        ].filter(Boolean);
+                        for (const el of targets) {
+                          try {
+                            el.scrollTop = (el.scrollTop || 0) + step;
+                          } catch (_err) {}
+                          try {
+                            el.scrollBy(0, step);
+                          } catch (_err) {}
+                        }
+                        window.scrollBy(0, step);
+                        """,
+                        step,
+                    )
+                except Exception:
+                    pass
+                time.sleep(0.45)
+
+        def click_authenticator_switch_like_gpt1():
+            script = """
+                const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+                let node;
+                const lowered = (value) => String(value || '').toLowerCase();
+                const isChecked = (el) => {
+                    if (!el) return false;
+                    const aria = lowered(el.getAttribute && el.getAttribute('aria-checked'));
+                    const state = lowered(el.getAttribute && el.getAttribute('data-state'));
+                    return aria === 'true' || state === 'checked';
+                };
+                while ((node = walker.nextNode())) {
+                    const text = lowered(node.nodeValue).trim();
+                    if (!text.includes('authenticator app') && !text.includes('ứng dụng xác thực')) continue;
+                    let parent = node.parentElement;
+                    for (let i = 0; i < 6; i++) {
+                        if (!parent) break;
+                        const toggle = parent.querySelector('button[role="switch"], [role="switch"], input[type="checkbox"]');
+                        if (toggle) {
+                            try { toggle.scrollIntoView({ block: 'center', behavior: 'instant' }); } catch (_err) {}
+                            if (!isChecked(toggle)) {
+                                try { toggle.click(); } catch (_err) {
+                                    try {
+                                        toggle.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                                    } catch (_err2) {}
+                                }
+                            }
+                            return {
+                                found: true,
+                                clicked: !isChecked(toggle),
+                                already_checked: isChecked(toggle),
+                                method: 'gpt1-text-node-toggle'
+                            };
+                        }
+                        parent = parent.parentElement;
+                    }
+                }
+
+                const visibleSwitches = Array.from(document.querySelectorAll('button[role="switch"], [role="switch"], input[type="checkbox"]'))
+                    .filter((el) => el && el.offsetParent !== null);
+                if (visibleSwitches.length > 0) {
+                    const first = visibleSwitches[0];
+                    try { first.scrollIntoView({ block: 'center', behavior: 'instant' }); } catch (_err) {}
+                    if (!isChecked(first)) {
+                        try { first.click(); } catch (_err) {
+                            try {
+                                first.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                            } catch (_err2) {}
+                        }
+                    }
+                    return {
+                        found: true,
+                        clicked: !isChecked(first),
+                        already_checked: isChecked(first),
+                        method: 'gpt1-first-visible-switch'
+                    };
+                }
+
+                return { found: false, clicked: false, already_checked: false, method: 'none' };
+            """
+            try:
+                result = driver.execute_script(script)
+            except Exception:
+                return None
+            return result if isinstance(result, dict) else None
+
+        def direct_gpt1_open_and_toggle():
+            security_url = "https://chatgpt.com/#settings/Security"
+            log_func(f"   🌐 Đang mở trực tiếp: {security_url}")
+            try:
+                driver.get(security_url)
+            except Exception:
+                return None
+            time.sleep(2.2)
+
+            for round_index in range(4):
+                if round_index > 0:
+                    log_func(f"   🔽 GPT-1 flow cuộn xuống lần {round_index}...")
+                scroll_security_dialog(step=900, rounds=1)
+                result = click_authenticator_switch_like_gpt1()
+                if result and result.get("found"):
+                    method = str(result.get("method") or "gpt1-js").strip()
+                    if result.get("already_checked"):
+                        log_func(f"   ✅ GPT-1 flow thấy switch đã bật ({method})")
+                        return result
+                    log_func(f"   ✅ GPT-1 flow đã click switch 2FA ({method})")
+                    time.sleep(0.8)
+                    return result
+            return None
+
+        def click_authenticator_switch_via_js():
+            script = """
+                const lowered = (value) => String(value || "").toLowerCase();
+                const isChecked = (el) => {
+                    if (!el) return false;
+                    const aria = lowered(el.getAttribute && el.getAttribute("aria-checked"));
+                    const dataState = lowered(el.getAttribute && el.getAttribute("data-state"));
+                    if (aria === "true" || dataState === "checked") return true;
+                    return false;
+                };
+                const clickEl = (el) => {
+                    if (!el) return false;
+                    try { el.scrollIntoView({ block: "center", behavior: "instant" }); } catch (_err) {}
+                    try { el.click(); return true; } catch (_err) {}
+                    try {
+                        el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+                        return true;
+                    } catch (_err) {}
+                    return false;
+                };
+                const findSwitchNear = (root) => {
+                    if (!root || !root.querySelectorAll) return null;
+                    const candidates = root.querySelectorAll('button[role="switch"], [role="switch"], input[type="checkbox"]');
+                    for (const candidate of candidates) {
+                        if (candidate && candidate.offsetParent !== null) return candidate;
+                    }
+                    return null;
+                };
+
+                const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+                let node = null;
+                while ((node = walker.nextNode())) {
+                    const text = lowered(node.nodeValue).trim();
+                    if (!text) continue;
+                    if (!text.includes("authenticator app") && !text.includes("ứng dụng xác thực")) continue;
+
+                    let parent = node.parentElement;
+                    for (let depth = 0; depth < 6 && parent; depth += 1) {
+                        const toggle = findSwitchNear(parent);
+                        if (toggle) {
+                            return {
+                                found: true,
+                                clicked: isChecked(toggle) ? false : clickEl(toggle),
+                                already_checked: isChecked(toggle),
+                                method: "text-node-nearby-switch",
+                            };
+                        }
+                        parent = parent.parentElement;
+                    }
+                }
+
+                const visibleSwitches = Array.from(document.querySelectorAll('button[role="switch"], [role="switch"], input[type="checkbox"]'))
+                    .filter((el) => el && el.offsetParent !== null);
+                if (visibleSwitches.length > 0) {
+                    const first = visibleSwitches[0];
+                    return {
+                        found: true,
+                        clicked: isChecked(first) ? false : clickEl(first),
+                        already_checked: isChecked(first),
+                        method: "first-visible-switch-fallback",
+                    };
+                }
+
+                return { found: false, clicked: false, already_checked: false, method: "none" };
+            """
+            try:
+                result = driver.execute_script(script)
+            except Exception:
+                return None
+            return result if isinstance(result, dict) else None
+
+        def find_authenticator_switch():
+            xpaths = [
+                '//*[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "authenticator app")]',
+                '//*[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZÀÁẠẢÃĂẮẰẲẴẶÂẤẦẨẪẬĐÈÉẸẺẼÊẾỀỂỄỆÌÍỊỈĨÒÓỌỎÕÔỐỒỔỖỘƠỚỜỞỠỢÙÚỤỦŨƯỨỪỬỮỰỲÝỴỶỸ", "abcdefghijklmnopqrstuvwxyzàáạảãăắằẳẵặâấầẩẫậđèéẹẻẽêếềểễệìíịỉĩòóọỏõôốồổỗộơớờởỡợùúụủũưứừửữựỳýỵỷỹ"), "ứng dụng xác thực")]',
+            ]
+            for xpath in xpaths:
+                try:
+                    labels = driver.find_elements(By.XPATH, xpath)
+                except Exception:
+                    labels = []
+                for label in labels:
+                    try:
+                        if not label.is_displayed():
+                            continue
+                        switch = label.find_elements(By.XPATH, './ancestor::*[self::div or self::button][1]//*[@role="switch"]')
+                        if switch:
+                            return label, switch[0]
+                        switch = label.find_elements(By.XPATH, './ancestor::*[self::div or self::button][1]//*[contains(@class, "radix") and (@data-state="checked" or @data-state="unchecked")]')
+                        if switch:
+                            return label, switch[0]
+                    except Exception:
+                        continue
+            return None, None
+
+        def scroll_security_view(step=700):
+            try:
+                driver.execute_script(
+                    """
+                    const step = arguments[0];
+                    const targets = [
+                      document.querySelector('[role="dialog"] [class*="overflow"]'),
+                      document.querySelector('[role="dialog"]'),
+                      document.querySelector('main'),
+                      document.scrollingElement || document.documentElement,
+                    ].filter(Boolean);
+                    for (const el of targets) {
+                      try {
+                        el.scrollTop = (el.scrollTop || 0) + step;
+                      } catch (_err) {}
+                    }
+                    window.scrollBy(0, step);
+                    """,
+                    step,
+                )
+            except Exception:
+                pass
+            time.sleep(0.4)
+
+        direct_toggle_result = direct_gpt1_open_and_toggle()
+        if direct_toggle_result and direct_toggle_result.get("found"):
+            enable_button = True
+        else:
+            open_security_settings()
+            time.sleep(0.8)
+            dismiss_chatgpt_onboarding_if_present(driver, max_rounds=4)
+            try:
+                log_func(f"   [Debug] URL settings hiện tại: {driver.current_url}")
+            except Exception:
+                pass
+
+            security_selectors = [
+                (By.XPATH, '//*[self::button or self::div or self::a][contains(normalize-space(.), "Security") or contains(normalize-space(.), "Bảo mật")]'),
+            ]
+            for by, selector in security_selectors:
+                try:
+                    nodes = driver.find_elements(by, selector)
+                except Exception:
+                    nodes = []
+                for node in nodes:
+                    try:
+                        if not node.is_displayed():
+                            continue
+                        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", node)
+                        try:
+                            node.click()
+                        except Exception:
+                            driver.execute_script("arguments[0].click();", node)
+                        log_func("   ✅ Đã mở tab Security / Bảo mật")
+                        time.sleep(0.6)
+                        break
+                    except Exception:
+                        continue
+
+            log_func("   🧭 Cuộn xuống khu vực Security để tìm mục Authenticator app...")
+            for warmup_scroll in range(3):
+                scroll_security_dialog(step=850, rounds=1)
+                scroll_security_view(step=300)
+                time.sleep(0.5)
+
+            enable_selectors = [
+                (By.XPATH, '//*[self::button or self::a or @role="button" or self::div or self::span][contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "authenticator app")]'),
+                (By.XPATH, '//*[self::button or self::a or @role="button" or self::div][contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "enable two-factor authentication")]'),
+                (By.XPATH, '//*[self::button or self::a or @role="button" or self::div][contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "set up two-factor authentication")]'),
+                (By.XPATH, '//*[self::button or self::a or @role="button" or self::div][contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "two-factor authentication")]'),
+                (By.XPATH, '//*[self::button or self::a or @role="button" or self::div][contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZÀÁẠẢÃĂẮẰẲẴẶÂẤẦẨẪẬĐÈÉẸẺẼÊẾỀỂỄỆÌÍỊỈĨÒÓỌỎÕÔỐỒỔỖỘƠỚỜỞỠỢÙÚỤỦŨƯỨỪỬỮỰỲÝỴỶỸ", "abcdefghijklmnopqrstuvwxyzàáạảãăắằẳẵặâấầẩẫậđèéẹẻẽêếềểễệìíịỉĩòóọỏõôốồổỗộơớờởỡợùúụủũưứừửữựỳýỵỷỹ"), "bật xác thực hai yếu tố")]'),
+                (By.XPATH, '//*[self::button or self::a or @role="button" or self::div][contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZÀÁẠẢÃĂẮẰẲẴẶÂẤẦẨẪẬĐÈÉẸẺẼÊẾỀỂỄỆÌÍỊỈĨÒÓỌỎÕÔỐỒỔỖỘƠỚỜỞỠỢÙÚỤỦŨƯỨỪỬỮỰỲÝỴỶỸ", "abcdefghijklmnopqrstuvwxyzàáạảãăắằẳẵặâấầẩẫậđèéẹẻẽêếềểễệìíịỉĩòóọỏõôốồổỗộơớờởỡợùúụủũưứừửữựỳýỵỷỹ"), "xác thực hai yếu tố")]'),
+            ]
+            enable_button = None
+            for scroll_round in range(5):
+                log_func(f"   🔎 Quét mục 2FA ở vị trí cuộn lần {scroll_round + 1}...")
+
+                gpt1_toggle_result = click_authenticator_switch_like_gpt1()
+                if gpt1_toggle_result and gpt1_toggle_result.get("found"):
+                    method = str(gpt1_toggle_result.get("method") or "gpt1-js").strip()
+                    if gpt1_toggle_result.get("already_checked"):
+                        log_func(f"   ✅ JS kiểu GPT-1 xác nhận switch đã bật ({method})")
+                        enable_button = True
+                        break
+                    if gpt1_toggle_result.get("clicked"):
+                        log_func(f"   ✅ JS kiểu GPT-1 đã click switch Authenticator app ({method})")
+                        enable_button = True
+                        break
+
+                js_toggle_result = click_authenticator_switch_via_js()
+                if js_toggle_result and js_toggle_result.get("found"):
+                    method = str(js_toggle_result.get("method") or "js").strip()
+                    if js_toggle_result.get("already_checked"):
+                        log_func(f"   ✅ JS đã xác nhận Authenticator app đang bật ({method})")
+                        enable_button = True
+                        break
+                    if js_toggle_result.get("clicked"):
+                        log_func(f"   ✅ JS đã click được switch Authenticator app ({method})")
+                        enable_button = True
+                        break
+
+                auth_label, auth_switch = find_authenticator_switch()
+                if auth_switch:
+                    try:
+                        state = (
+                            auth_switch.get_attribute("aria-checked")
+                            or auth_switch.get_attribute("data-state")
+                            or ""
+                        ).strip().lower()
+                    except Exception:
+                        state = ""
+                    if auth_label:
+                        try:
+                            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", auth_label)
+                            time.sleep(0.3)
+                        except Exception:
+                            pass
+                    if state in {"true", "checked"}:
+                        log_func("   ✅ Authenticator app đã ở trạng thái bật")
+                        enable_button = auth_switch
+                        break
+                    log_func("   ✅ Tìm thấy dòng Authenticator app, sẽ thử click bật switch")
+                    enable_button = auth_switch
+                    break
+
+                for by, selector in enable_selectors:
+                    try:
+                        buttons = driver.find_elements(by, selector)
+                    except Exception:
+                        buttons = []
+                    for button in buttons:
+                        try:
+                            if button.is_displayed() and button.is_enabled():
+                                enable_button = button
+                                break
+                        except Exception:
+                            continue
+                    if enable_button:
+                        break
+                if enable_button:
+                    break
+                log_func(f"   🔽 Chưa thấy mục bật 2FA, cuộn xuống thêm...")
+                scroll_security_dialog(step=950, rounds=2)
+                scroll_security_view(step=850)
+
+        if 'enable_button' not in locals():
+            enable_button = None
+        if not enable_button:
+            try:
+                body_text = driver.find_element(By.TAG_NAME, "body").text or ""
+                snippet = "\n".join(line for line in body_text.splitlines() if line.strip())[:1200]
+                log_func(f"   [Debug] Nội dung settings/security hiện tại:\n{snippet}")
+            except Exception:
+                pass
+            log_func("   ⚠️ Không tìm thấy nút bật 2FA, có thể đã bật sẵn hoặc UI thay đổi")
+            return {"success": False, "reason": "Không tìm thấy nút bật 2FA"}
+
+        if enable_button is not True:
+            try:
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", enable_button)
+                time.sleep(0.1)
+                enable_button.click()
+            except Exception:
+                driver.execute_script("arguments[0].click();", enable_button)
+            time.sleep(0.8)
+
+            try:
+                switch_state = (
+                    enable_button.get_attribute("aria-checked")
+                    or enable_button.get_attribute("data-state")
+                    or ""
+                ).strip().lower()
+            except Exception:
+                switch_state = ""
+            if switch_state in {"true", "checked"}:
+                log_func("   ✅ Switch Authenticator app đã bật")
+        else:
+            time.sleep(3)
+
+        password_inputs = _visible_elements(driver, 'input[name="password"], input[type="password"], input[autocomplete="current-password"]')
+        if password_inputs:
+            log_func("   🔑 2FA yêu cầu xác nhận mật khẩu, đang nhập...")
+            robust_fill_input(driver, password_inputs[0], password, label="mật khẩu 2FA")
+            click_button_with_retry(driver, 'button[type="submit"]', max_retries=2)
+            time.sleep(0.8)
+
+        if _click_manual_2fa_secret_link(driver):
+            log_func("   ✅ Đã mở màn secret 2FA dạng chữ")
+        else:
+            log_func("   ℹ️ Không thấy link manual secret, thử đọc secret trực tiếp từ popup hiện tại")
+
+        secret = _extract_2fa_secret_from_page(driver)
+        if not secret:
+            log_func("   ⚠️ Không lấy được secret key 2FA từ trang")
+            return {"success": False, "reason": "Không lấy được secret key"}
+
+        log_func(f"   ✅ Đã lấy secret 2FA: {secret[:8]}...")
+        code_input = find_code_input_fast(driver, timeout=3)
+        if not code_input:
+            code_candidates = _visible_elements(driver, 'input[inputmode="numeric"], input[autocomplete="one-time-code"], input[type="text"]')
+            code_input = code_candidates[0] if code_candidates else None
+        if not code_input:
+            return {"success": False, "reason": "Không tìm thấy ô nhập mã 2FA"}
+
+        current_ts = int(time.time())
+        attempt_schedule = [
+            ("current", current_ts),
+            ("previous-window", current_ts - 30),
+            ("next-window", current_ts + 30),
+        ]
+        verified = False
+        last_code = ""
+        for label, timestamp in attempt_schedule:
+            totp_code = _generate_totp_code_at(secret, timestamp, interval=30)
+            last_code = totp_code
+            log_func(f"   🔢 Đang thử mã TOTP ({label}): {totp_code}")
+            robust_fill_input(driver, code_input, totp_code, label="mã 2FA")
+            if _click_2fa_verify_button(driver):
+                log_func("   ✅ Đã bấm nút Xác minh")
+            else:
+                try:
+                    code_input.send_keys(Keys.ENTER)
+                except Exception:
+                    pass
+            verify_state = _wait_for_2fa_dialog_progress(driver, timeout_seconds=3.5)
+            if verify_state == "invalid":
+                continue
+            if verify_state == "verified":
+                verified = True
+                break
+            verified = True
+            break
+
+        if not verified:
+            return {"success": False, "reason": f"Không verify được mã 2FA local: {last_code}"}
+
+        backup_codes = _collect_2fa_backup_codes(driver)
+        if backup_codes:
+            log_func(f"   ✅ Đã lấy {len(backup_codes)} backup codes 2FA")
+        else:
+            log_func("   ℹ️ Chưa đọc được backup codes, có thể UI không hiển thị ngay")
+
+        return {
+            "success": True,
+            "secret": secret,
+            "backup_codes": backup_codes,
+            "verified": True,
+            "stage": "verified",
+        }
+    except Exception as e:
+        log_func(f"   ❌ Lỗi setup 2FA: {e}")
+        return {"success": False, "reason": str(e)}
+
+
+def classify_after_password_submit(driver):
+    try:
+        current_url = driver.current_url
+    except Exception:
+        current_url = ""
+
+    if is_chatgpt_home_ready(driver):
+        return "home", current_url
+
+    if "/about-you" in current_url:
+        return "about_you", current_url
+
+    if "email-verification/register" in current_url:
+        code_input = find_code_input_fast(driver, timeout=0.2)
+        if code_input:
+            return "otp", current_url
+        if find_profile_name_input_fast(driver, timeout=0.2) or find_birthdate_input(driver) or find_age_input(driver):
+            return "profile_form", current_url
+
+    if _visible_elements(driver, CODE_INPUT_SELECTOR):
+        return "otp", current_url
+
+    if _visible_elements(driver, PROFILE_INPUT_SELECTOR) or find_birthdate_input(driver) or find_age_input(driver):
+        return "profile_form", current_url
+
+    alerts = _visible_alert_texts(driver)
+    if alerts:
+        return "page_error", alerts[0]
+
+    ready_state = _document_ready_state(driver)
+    if ready_state != "complete":
+        return "loading", ready_state
+
+    return "transitioning", current_url
+
+
 def fill_signup_form(driver, email: str, password: str):
     """
     Điền form đăng ký
@@ -1960,6 +3052,7 @@ def fill_signup_form(driver, email: str, password: str):
     wait = WebDriverWait(driver, MAX_WAIT_TIME)
     
     try:
+        setattr(driver, "signup_post_password_state", "")
         print(f"DEBUG: Tiêu đề trang hiện tại: {driver.title}")
         print(f"DEBUG: URL trang hiện tại: {driver.current_url}")
         
@@ -2164,6 +3257,15 @@ def fill_signup_form(driver, email: str, password: str):
                     print("✅ Phát hiện form đăng ký inline email/OTP/hồ sơ")
                     break
 
+                if state == "password_switch":
+                    print("🔀 Phát hiện nút 'Tiếp tục với mật khẩu', ưu tiên điền mật khẩu trước OTP...")
+                    if click_continue_with_password(driver, timeout=3):
+                        _wait_for_url_or_dom_settle(driver, timeout=6, stable_for=0.6)
+                        last_state = ""
+                        same_state_since = time.time()
+                        continue
+                    break
+
                 if state == "otp":
                     visible_code_inputs = _visible_elements(driver, CODE_INPUT_SELECTOR)
                     code_input = visible_code_inputs[0] if visible_code_inputs else find_code_input_fast(driver, timeout=0.5)
@@ -2253,7 +3355,30 @@ def fill_signup_form(driver, email: str, password: str):
         print("✅ Đã click tiếp tục")
 
         check_and_handle_error(driver)
+        post_password_deadline = time.time() + 15
+        last_state = ""
+        while time.time() < post_password_deadline:
+            state, detail = classify_after_password_submit(driver)
+            if state != last_state:
+                print(f"  Trạng thái sau mật khẩu: {state}" + (f" | {detail}" if detail else ""))
+                last_state = state
+
+            if state in ("home", "about_you", "profile_form"):
+                setattr(driver, "signup_post_password_state", "logged_in_no_otp")
+                print("✅ Account đã vào đúng giao diện sau bước mật khẩu, không cần OTP")
+                return True
+
+            if state == "otp":
+                setattr(driver, "signup_post_password_state", "otp_required")
+                print("✅ Sau bước mật khẩu vẫn yêu cầu OTP email")
+                return True
+
+            if state == "page_error":
+                break
+
+            time.sleep(0.35)
         
+        setattr(driver, "signup_post_password_state", "otp_required")
         return True
         
     except Exception as e:
@@ -2455,7 +3580,7 @@ def enter_verification_code(driver, code: str):
             post_submit_url = ""
         _wait_for_url_or_dom_settle(driver, previous_url=post_submit_url, timeout=10, stable_for=1.2)
 
-        deadline = time.time() + 25
+        deadline = time.time() + OTP_POST_SUBMIT_TRANSITION_TIMEOUT
         last_state = ""
         same_state_since = time.time()
         while time.time() < deadline:
@@ -2519,7 +3644,7 @@ def enter_verification_code(driver, code: str):
             print("✅ OTP form không còn hiển thị sau khi chờ, chuyển sang bước hồ sơ")
             return "accepted"
 
-        print("⚠️ Sau khi nhập OTP vẫn chưa sang bước họ tên, cần lấy lại OTP")
+        print(f"⚠️ Sau khi nhập OTP {OTP_POST_SUBMIT_TRANSITION_TIMEOUT}s vẫn chưa sang bước họ tên, cần lấy lại OTP")
         if was_inline_registration or is_inline_registration_form(driver):
             return "inline_retry"
         return "retry"
