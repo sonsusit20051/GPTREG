@@ -447,6 +447,10 @@ class EmailService:
             raise RuntimeError(f"HTTP {response.status_code}: {response.text[:200]}")
 
         data = response.json()
+        response_email = self._response_email(data)
+        if response_email and response_email.lower() != account.email.lower():
+            print(f"  ⚠️ get_code_oauth2 trả mailbox khác ({response_email}), bỏ qua vì đang chờ {account.email}")
+            return None
         nested_data = data.get("data")
         source = nested_data if isinstance(nested_data, dict) else data
         raw_date = source.get("date") or data.get("date") or ""

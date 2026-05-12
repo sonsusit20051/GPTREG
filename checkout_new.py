@@ -94,6 +94,32 @@ def _checkout_payload(country_code: str, currency: str) -> dict[str, Any]:
     }
 
 
+def _checkout_payload_vn_apple_pay() -> dict[str, Any]:
+    return {
+        "plan_name": "chatgptplusplan",
+        "billing_details": {
+            "country": "VN",
+            "currency": "VND",
+        },
+        "cancel_url": "https://chatgpt.com/",
+        "success_url": "https://chatgpt.com/",
+        "promo_campaign": {
+            "promo_campaign_id": "plus-1-month-free",
+            "is_coupon_from_query_param": False,
+        },
+        "checkout_ui_mode": "hosted",
+        "subscription_type": "plus",
+        "trial_period_days": 30,
+        "trial_end_action": "charge",
+        "metadata": {
+            "campaign": "plus-1-month-free",
+            "source": "pricing_page",
+        },
+        "payment_method_types": ["card", "apple_pay"],
+        "preferred_payment_method": "apple_pay",
+    }
+
+
 def _extract_checkout_url(value: Any) -> str | None:
     """Tìm checkout URL dù response đổi key hoặc lồng nhiều tầng."""
     if isinstance(value, str):
@@ -446,6 +472,56 @@ def create_trial_checkout_from_auth_context(
     }
 
 
+def create_vn_trial_checkout_from_auth_context(
+    auth_context: dict[str, Any],
+    log_func=None,
+) -> dict[str, Any]:
+    payload = _checkout_payload_vn_apple_pay()
+    token = str((auth_context or {}).get("token") or "").strip()
+    if not token:
+        return {"success": False, "failure_reason": "Không có access token trong auth_context"}
+
+    _log(log_func, "   🌐 Đang gọi checkout API VN (ưu tiên Apple Pay) bằng requests-only...")
+    session = requests.Session()
+    for cookie in list((auth_context or {}).get("cookies") or []):
+        name = cookie.get("name")
+        value = cookie.get("value")
+        if name and value is not None:
+            session.cookies.set(name, value, domain=cookie.get("domain"), path=cookie.get("path") or "/")
+
+    resp = session.post(
+        CHECKOUT_API_URL,
+        json=payload,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json",
+            "Origin": "https://chatgpt.com",
+            "Referer": "https://chatgpt.com/?promo_campaign=plus-1-month-free",
+            "User-Agent": str((auth_context or {}).get("user_agent") or "Mozilla/5.0"),
+        },
+        timeout=DEFAULT_TIMEOUT,
+    )
+
+    try:
+        data = resp.json()
+    except Exception:
+        data = {"raw_text": resp.text[:1000]}
+
+    if resp.ok:
+        result = _normalize_checkout_result(data)
+        if result.get("success"):
+            _log(log_func, "   ✅ Đã lấy được checkout link VN từ auth context")
+            _log(log_func, f"   🔗 {result['checkout_url']}")
+        return result
+
+    return {
+        "success": False,
+        "failure_reason": f"Checkout VN API lỗi HTTP {resp.status_code}: {data}",
+        "raw": data,
+    }
+
+
 def create_trial_checkout(driver, country_code: str = "ID", currency: str = "IDR", log_func=None) -> dict[str, Any]:
     """
     Tao link checkout trial moi.
@@ -474,3 +550,70 @@ def create_trial_checkout(driver, country_code: str = "ID", currency: str = "IDR
         _log(log_func, "   ✅ Đã lấy được checkout link trial mới qua requests")
         _log(log_func, f"   🔗 {requests_result['checkout_url']}")
     return requests_result
+
+
+def create_vn_trial_checkout(driver, log_func=None) -> dict[str, Any]:
+    """
+    Tạo link checkout VN tối ưu Apple Pay, bám sát payload userscript.
+    """
+    payload = _checkout_payload_vn_apple_pay()
+
+    browser_result = _browser_fetch_checkout(driver, payload, log_func=log_func)
+    if browser_result.get("success"):
+        _log(log_func, "   ✅ Đã lấy được checkout link VN từ browser")
+        _log(log_func, f"   🔗 {browser_result['checkout_url']}")
+        return browser_result
+
+    _log(log_func, f"   ⚠️ Browser checkout VN chưa thành công: {browser_result.get('failure_reason')}")
+
+    token = _get_access_token_from_session(driver, log_func=log_func)
+    if not token:
+        return {"success": False, "failure_reason": "Không lấy được access token"}
+
+    _log(log_func, "   🌐 Fallback gọi checkout VN API bằng requests...")
+    session = requests.Session()
+    try:
+        user_agent = driver.execute_script("return navigator.userAgent || ''") or ""
+    except Exception:
+        user_agent = ""
+
+    try:
+        for cookie in driver.get_cookies():
+            name = cookie.get("name")
+            value = cookie.get("value")
+            if name and value is not None:
+                session.cookies.set(name, value, domain=cookie.get("domain"), path=cookie.get("path") or "/")
+    except Exception as e:
+        _log(log_func, f"   ⚠️ Không copy được cookies từ browser sang requests: {e}")
+
+    resp = session.post(
+        CHECKOUT_API_URL,
+        json=payload,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json",
+            "Origin": "https://chatgpt.com",
+            "Referer": "https://chatgpt.com/?promo_campaign=plus-1-month-free",
+            "User-Agent": user_agent or "Mozilla/5.0",
+        },
+        timeout=DEFAULT_TIMEOUT,
+    )
+
+    try:
+        data = resp.json()
+    except Exception:
+        data = {"raw_text": resp.text[:1000]}
+
+    if resp.ok:
+        result = _normalize_checkout_result(data)
+        if result.get("success"):
+            _log(log_func, "   ✅ Đã lấy được checkout link VN qua requests")
+            _log(log_func, f"   🔗 {result['checkout_url']}")
+        return result
+
+    return {
+        "success": False,
+        "failure_reason": f"Checkout VN API lỗi HTTP {resp.status_code}: {data}",
+        "raw": data,
+    }

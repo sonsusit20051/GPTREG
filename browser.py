@@ -8,12 +8,14 @@ import atexit
 import os
 import random
 import subprocess
+import json
 import threading
 import time
 import base64
 import hashlib
 import hmac
 import struct
+from urllib.parse import urlsplit
 import undetected_chromedriver as uc
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -67,6 +69,7 @@ _visible_window_slot_lock = threading.Lock()
 _visible_window_slot_index = 0
 _visible_grid_override = None
 _profile_zoom_override = None
+_gpm_raw_proxy_override = None
 HOME_READY_STABLE_SECONDS = 5
 OTP_POST_SUBMIT_TRANSITION_TIMEOUT = 10
 
@@ -94,6 +97,33 @@ def set_visible_grid_override(cols=None, rows=None, width=None, height=None):
 def set_profile_zoom_override(zoom_factor=None):
     global _profile_zoom_override
     _profile_zoom_override = float(zoom_factor) if zoom_factor else None
+
+
+def set_gpm_raw_proxy_override(raw_proxy=None):
+    global _gpm_raw_proxy_override
+    _gpm_raw_proxy_override = str(raw_proxy or "").strip() or None
+
+
+def _plain_chrome_proxy_argument():
+    raw_proxy = str(_gpm_raw_proxy_override or "").strip()
+    if not raw_proxy:
+        return ""
+    try:
+        parsed = urlsplit(raw_proxy if "://" in raw_proxy else f"http://{raw_proxy}")
+        scheme = (parsed.scheme or "http").lower()
+        host = parsed.hostname or ""
+        port = parsed.port
+        username = parsed.username or ""
+        password = parsed.password or ""
+        if not host or not port:
+            return ""
+        if username or password:
+            print("⚠️ Chrome thường không hỗ trợ tốt proxy auth bằng --proxy-server, tạm bỏ qua proxy auth ở mode Canva")
+            return ""
+        return f"{scheme}://{host}:{port}"
+    except Exception as e:
+        print(f"⚠️ Không parse được proxy cho Chrome thường: {e}")
+        return ""
 
 
 def get_profile_zoom_factor(default=1.0):
@@ -140,6 +170,46 @@ def get_chrome_major_version():
     return None
 
 
+def _install_mouse_event_screen_patch(driver):
+    """Giả lập screenX/screenY ổn định hơn cho MouseEvent/PointerEvent."""
+    source = """
+        (() => {
+            try {
+                const screenXSeed = Math.floor(Math.random() * 401) + 800;
+                const screenYSeed = Math.floor(Math.random() * 201) + 400;
+                const patchProto = (proto) => {
+                    if (!proto) return;
+                    try {
+                        Object.defineProperty(proto, 'screenX', {
+                            get: function() {
+                                const cx = Number(this.clientX || 0);
+                                return Math.round(cx + screenXSeed);
+                            },
+                            configurable: true,
+                        });
+                    } catch (_e) {}
+                    try {
+                        Object.defineProperty(proto, 'screenY', {
+                            get: function() {
+                                const cy = Number(this.clientY || 0);
+                                return Math.round(cy + screenYSeed);
+                            },
+                            configurable: true,
+                        });
+                    } catch (_e) {}
+                };
+                patchProto(window.MouseEvent && window.MouseEvent.prototype);
+                patchProto(window.PointerEvent && window.PointerEvent.prototype);
+            } catch (_err) {}
+        })();
+    """
+    try:
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": source})
+        return True
+    except Exception:
+        return False
+
+
 def _pick_gpm_profile_id():
     global _gpm_profile_index
 
@@ -168,7 +238,7 @@ def _create_gpm_profile():
     payload = {
         "name": profile_name,
         "group_id": None,
-        "raw_proxy": GPM_RAW_PROXY or "",
+        "raw_proxy": _gpm_raw_proxy_override or GPM_RAW_PROXY or "",
         "browser_type": 1,
         "browser_version": browser_version,
         "os_type": GPM_OS_TYPE,
@@ -352,13 +422,16 @@ def _find_local_chromedriver():
 
 def _attach_gpm_close_hook(driver, profile_id):
     original_quit = driver.quit
+    cleanup_done = False
 
     def quit_with_gpm_close():
-        _cleanup_gpm_profile(profile_id, reason="driver.quit", stop_first=True, delete_created=GPM_AUTO_CREATE)
+        nonlocal cleanup_done
         try:
             original_quit()
         finally:
-            _cleanup_gpm_profile(profile_id, reason="sau driver.quit", stop_first=True, delete_created=GPM_AUTO_CREATE)
+            if not cleanup_done:
+                _cleanup_gpm_profile(profile_id, reason="driver.quit", stop_first=True, delete_created=GPM_AUTO_CREATE)
+                cleanup_done = True
 
     driver.gpm_profile_id = profile_id
     driver.quit = quit_with_gpm_close
@@ -561,10 +634,15 @@ def create_gpm_driver():
     print(f"🧬 Đang mở GPM Login profile: {profile_id}")
     start_params = {}
     visible_rect = _allocate_visible_window_rect() if VISIBLE_GRID_ENABLED else None
+    autofill_disable_args = (
+        "--disable-features=AutofillAddressProfileSavePrompt,AutofillEnableAccountWalletStorage "
+        "--disable-save-password-bubble --disable-single-click-autofill"
+    )
     if visible_rect:
         launch_args = (
             f"--window-position={visible_rect['left']},{visible_rect['top']} "
-            f"--window-size={visible_rect['width']},{visible_rect['height']}"
+            f"--window-size={visible_rect['width']},{visible_rect['height']} "
+            f"{autofill_disable_args}"
         )
         start_params.update({
             "win_pos": f"{visible_rect['left']},{visible_rect['top']}",
@@ -582,7 +660,10 @@ def create_gpm_driver():
             f"{visible_rect['width']}x{visible_rect['height']}"
         )
     elif BACKGROUND_MODE:
-        launch_args = f"--window-position={OFFSCREEN_X},{OFFSCREEN_Y} --window-size=1200,800"
+        launch_args = (
+            f"--window-position={OFFSCREEN_X},{OFFSCREEN_Y} "
+            f"--window-size=1200,800 {autofill_disable_args}"
+        )
         start_params.update({
             "win_pos": f"{OFFSCREEN_X},{OFFSCREEN_Y}",
             "win_size": "1200,800",
@@ -594,6 +675,13 @@ def create_gpm_driver():
             "browser_args": launch_args,
         })
         print(f"👻 GPM background_mode=true, yêu cầu mở profile ngoài màn hình: {OFFSCREEN_X},{OFFSCREEN_Y}")
+    else:
+        start_params.update({
+            "args": autofill_disable_args,
+            "addination_args": autofill_disable_args,
+            "additional_args": autofill_disable_args,
+            "browser_args": autofill_disable_args,
+        })
 
     response = http_session.get(start_url, params=start_params or None, timeout=45)
     response.raise_for_status()
@@ -673,7 +761,7 @@ class SafeChrome(uc.Chrome):
             pass
 
 
-def create_driver(headless=False):
+def create_driver(headless=False, force_plain=False):
     """
     Tạo driver trình duyệt undetected Chrome
     
@@ -685,12 +773,32 @@ def create_driver(headless=False):
     """
     headless = bool(headless or BACKGROUND_MODE)
 
-    if GPM_ENABLED:
+    if GPM_ENABLED and not force_plain:
         print("🧬 browser.gpm_enabled=true, dùng trình duyệt anti-detect từ GPM Login")
         return create_gpm_driver()
+    if GPM_ENABLED and force_plain:
+        print("🌐 Đang ép dùng Chrome thường cho flow này, bỏ qua GPM")
 
     print(f"🌐 Đang khởi tạo trình duyệt (Headless: {headless})...")
     options = uc.ChromeOptions()
+    options.add_experimental_option(
+        "prefs",
+        {
+            "autofill.profile_enabled": False,
+            "autofill.address_enabled": False,
+            "autofill.credit_card_enabled": False,
+            "credentials_enable_service": False,
+            "profile.password_manager_enabled": False,
+            "profile.password_manager_leak_detection": False,
+        },
+    )
+    options.add_argument("--disable-features=AutofillAddressProfileSavePrompt,AutofillEnableAccountWalletStorage")
+    options.add_argument("--disable-save-password-bubble")
+    options.add_argument("--disable-single-click-autofill")
+    proxy_argument = _plain_chrome_proxy_argument()
+    if proxy_argument:
+        options.add_argument(f"--proxy-server={proxy_argument}")
+        print(f"🌐 Chrome thường sẽ dùng proxy: {proxy_argument}")
     
     # === Chế độ headless giả (Fake Headless) ===
     # Headless thật rất khó vượt Cloudflare, nên dùng chiến lược đưa cửa sổ ra ngoài màn hình
@@ -723,6 +831,8 @@ def create_driver(headless=False):
     driver.set_page_load_timeout(120)
     driver.set_script_timeout(30)
     print("✅ ChromeDriver session đã sẵn sàng")
+    if _install_mouse_event_screen_patch(driver):
+        print("🖱️ Đã bật mouse-event screen patch cho document mới")
     apply_default_profile_zoom(driver, zoom_factor=1.0)
     
     # === Ngụy trang sâu cho chế độ headless ===
@@ -783,6 +893,406 @@ def create_driver(headless=False):
         })
 
     return driver
+
+
+def _canva_find_clickable(driver, xpaths, timeout=12):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        _dismiss_canva_cookie_banner(driver, timeout=0.5)
+        for xpath in xpaths:
+            try:
+                candidates = driver.find_elements(By.XPATH, xpath)
+            except Exception:
+                candidates = []
+            for candidate in candidates:
+                try:
+                    if not candidate.is_displayed() or not candidate.is_enabled():
+                        continue
+                    scroll_element_and_ancestors_into_view(driver, candidate)
+                    return candidate
+                except Exception:
+                    continue
+        time.sleep(0.25)
+    return None
+
+
+def _canva_human_pause(min_seconds=0.6, max_seconds=1.4):
+    time.sleep(random.uniform(min_seconds, max_seconds))
+
+
+def _detect_canva_security_block(driver):
+    try:
+        page_text = (driver.find_element(By.TAG_NAME, "body").text or "").strip()
+    except Exception:
+        page_text = ""
+    if not page_text:
+        try:
+            page_text = str(driver.page_source or "")
+        except Exception:
+            page_text = ""
+    normalized = page_text.lower()
+    if (
+        "chúng tôi không thể gửi mã xác minh" in normalized
+        or "we can't send a verification code" in normalized
+        or "we cannot send a verification code" in normalized
+        or "hãy thử kết nối với mạng wi-fi khác" in normalized
+        or "turn off vpn" in normalized
+    ):
+        code_match = re.search(r"(RRS[-‑][A-Za-z0-9]+)", page_text)
+        code = code_match.group(1) if code_match else ""
+        reason = "Canva chặn gửi mã xác minh do risk/security"
+        if code:
+            reason += f" ({code})"
+        return reason
+    return ""
+
+
+def _dismiss_canva_cookie_banner(driver, timeout=3):
+    deadline = time.time() + timeout
+    cookie_xpaths = [
+        '//button[contains(normalize-space(.), "Chấp nhận cookie")]',
+        '//button[contains(normalize-space(.), "Chấp nhận tất cả cookie")]',
+        '//button[contains(normalize-space(.), "Từ chối cookie")]',
+        '//button[contains(normalize-space(.), "Chỉ chấp nhận cookie cần thiết")]',
+        '//button[contains(normalize-space(.), "Accept cookies")]',
+        '//button[contains(normalize-space(.), "Accept all cookies")]',
+        '//button[contains(normalize-space(.), "Reject cookies")]',
+        '//button[contains(normalize-space(.), "Only necessary cookies")]',
+        '//*[@id="onetrust-banner-sdk"]//button',
+        '//*[contains(@class, "onetrust")]//button',
+        '//*[contains(@data-testid, "cookie")]//button',
+    ]
+    while time.time() < deadline:
+        for xpath in cookie_xpaths:
+            try:
+                buttons = driver.find_elements(By.XPATH, xpath)
+            except Exception:
+                buttons = []
+            for button in buttons:
+                try:
+                    if not button.is_displayed() or not button.is_enabled():
+                        continue
+                    button_text = (button.text or "").strip()
+                    button_html = ""
+                    try:
+                        button_html = (button.get_attribute("outerHTML") or "").lower()
+                    except Exception:
+                        button_html = ""
+                    if not (
+                        "cookie" in button_text.lower()
+                        or "cookie" in button_html
+                        or "onetrust" in button_html
+                    ):
+                        continue
+                    scroll_element_and_ancestors_into_view(driver, button)
+                    try:
+                        button.click()
+                    except Exception:
+                        driver.execute_script("arguments[0].click();", button)
+                    print(f"  🍪 Canva: đã xử lý cookie riêng của Canva: {button_text or 'button'}")
+                    time.sleep(0.4)
+                    return True
+                except Exception:
+                    continue
+        time.sleep(0.2)
+    return False
+
+
+def _canva_click(driver, xpaths, label, timeout=12):
+    button = _canva_find_clickable(driver, xpaths, timeout=timeout)
+    if not button:
+        return False
+    _canva_human_pause(0.4, 0.9)
+    try:
+        button.click()
+    except Exception:
+        try:
+            driver.execute_script("arguments[0].click();", button)
+        except Exception:
+            return False
+    print(f"✅ Canva: đã bấm {label}")
+    return True
+
+
+def _canva_wait_visible_input(driver, selectors, timeout=15):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        _dismiss_canva_cookie_banner(driver, timeout=0.3)
+        for selector in selectors:
+            try:
+                elements = _visible_elements(driver, selector)
+            except Exception:
+                elements = []
+            if elements:
+                element = elements[0]
+                try:
+                    scroll_element_and_ancestors_into_view(driver, element)
+                    driver.execute_script("arguments[0].focus();", element)
+                except Exception:
+                    pass
+                return element
+        time.sleep(0.25)
+    return None
+
+
+def complete_canva_email_signup_and_redeem(
+    driver,
+    email: str,
+    *,
+    otp_fetcher=None,
+    promo_code: str = "AFRICAGROW",
+    log_func=print,
+):
+    """Đăng ký Canva bằng email, nhập OTP, redeem mã và chọn MoMo."""
+    try:
+        log_func("🌐 Canva: đang mở trang chủ...")
+        driver.get("https://www.canva.com/vi_vn/")
+        _wait_for_url_or_dom_settle(driver, timeout=12, stable_for=1.0)
+        _dismiss_canva_cookie_banner(driver, timeout=2)
+        _canva_human_pause(0.8, 1.6)
+
+        entry_clicked = False
+        if _canva_click(
+            driver,
+            [
+                '//button[contains(normalize-space(.), "Đăng nhập")]',
+                '//a[contains(normalize-space(.), "Đăng nhập")]',
+                '//button[contains(normalize-space(.), "Log in")]',
+                '//a[contains(normalize-space(.), "Log in")]',
+                '//button[contains(normalize-space(.), "Login")]',
+                '//a[contains(normalize-space(.), "Login")]',
+            ],
+            "Đăng nhập",
+            timeout=8,
+        ):
+            entry_clicked = True
+        elif _canva_click(
+            driver,
+            [
+                '//button[contains(normalize-space(.), "Đăng ký")]',
+                '//a[contains(normalize-space(.), "Đăng ký")]',
+                '//button[contains(normalize-space(.), "Sign up")]',
+                '//a[contains(normalize-space(.), "Sign up")]',
+            ],
+            "Đăng ký",
+            timeout=15,
+        ):
+            entry_clicked = True
+
+        if not entry_clicked:
+            return {"success": False, "reason": "Không tìm thấy nút Đăng nhập/Đăng ký Canva"}
+
+        if not _canva_click(
+            driver,
+            [
+                '//button[contains(normalize-space(.), "Tiếp tục với email")]',
+                '//div[@role="button" and contains(normalize-space(.), "Tiếp tục với email")]',
+                '//button[contains(normalize-space(.), "Continue with email")]',
+            ],
+            "Tiếp tục với email",
+            timeout=15,
+        ):
+            return {"success": False, "reason": "Không tìm thấy nút Tiếp tục với email"}
+
+        email_selectors = [
+            'input[name="username"]',
+            'input[inputmode="email"]',
+            'input[autocomplete="username"]',
+            'input[type="email"]',
+            'input[autocomplete="email"]',
+            'input[name="email"]',
+        ]
+        email_input = _canva_wait_visible_input(driver, email_selectors, timeout=8)
+        if not email_input:
+            log_func("⏳ Canva: chưa thấy ô email, chờ modal ổn định rồi thử mở lại...")
+            _wait_for_url_or_dom_settle(driver, timeout=6, stable_for=0.8)
+            _canva_click(
+                driver,
+                [
+                    '//button[contains(normalize-space(.), "Tiếp tục với email")]',
+                    '//div[@role="button" and contains(normalize-space(.), "Tiếp tục với email")]',
+                    '//button[contains(normalize-space(.), "Continue with email")]',
+                ],
+                "Tiếp tục với email lần 2",
+                timeout=5,
+            )
+            email_input = _canva_wait_visible_input(driver, email_selectors, timeout=10)
+        if not email_input:
+            return {"success": False, "reason": "Không thấy ô nhập email Canva"}
+
+        _canva_human_pause(0.5, 1.2)
+        robust_fill_input(driver, email_input, email, label="email Canva")
+        log_func(f"✅ Canva: đã nhập email {email}")
+
+        code_requested_at = time.time()
+        if not _canva_click(
+            driver,
+            [
+                '//button[contains(normalize-space(.), "Tiếp tục")]',
+                '//button[contains(normalize-space(.), "Continue")]',
+            ],
+            "Tiếp tục sau email",
+            timeout=10,
+        ):
+            return {"success": False, "reason": "Không bấm được Tiếp tục sau email Canva"}
+
+        _wait_for_url_or_dom_settle(driver, timeout=10, stable_for=0.8)
+        block_reason = _detect_canva_security_block(driver)
+        if block_reason:
+            return {"success": False, "reason": block_reason}
+
+        name_input = _canva_wait_visible_input(
+            driver,
+            [
+                'input[autocomplete="name"]',
+                'input[name="name"]',
+                'input[placeholder*="Tên" i]',
+                'input[aria-label*="Tên" i]',
+            ],
+            timeout=8,
+        )
+        if name_input:
+            canva_name = ""
+            try:
+                canva_name = str(generate_user_info().get("name") or "").strip()
+            except Exception:
+                canva_name = ""
+            if not canva_name:
+                canva_name = "Alex Taylor"
+            _canva_human_pause(0.4, 0.9)
+            robust_fill_input(driver, name_input, canva_name, label="tên Canva")
+            log_func(f"✅ Canva: đã nhập tên {canva_name}")
+            _canva_human_pause(0.5, 1.1)
+            if not _canva_click(
+                driver,
+                [
+                    '//button[contains(normalize-space(.), "Tiếp tục")]',
+                    '//button[contains(normalize-space(.), "Continue")]',
+                ],
+                "Tiếp tục sau tên",
+                timeout=10,
+            ):
+                return {"success": False, "reason": "Không bấm được Tiếp tục ở bước tên Canva"}
+
+        block_reason = _detect_canva_security_block(driver)
+        if block_reason:
+            return {"success": False, "reason": block_reason}
+
+        otp_input = _canva_wait_visible_input(
+            driver,
+            [
+                'input[autocomplete="one-time-code"][maxlength="6"]',
+                'input[inputmode="numeric"]',
+                'input[autocomplete="one-time-code"]',
+                'input[name*="code" i]',
+                'input[aria-label*="mã" i]',
+                'input[aria-label*="code" i]',
+            ],
+            timeout=20,
+        )
+        if not otp_input:
+            block_reason = _detect_canva_security_block(driver)
+            if block_reason:
+                return {"success": False, "reason": block_reason}
+            return {"success": False, "reason": "Không thấy ô nhập OTP Canva"}
+
+        if not callable(otp_fetcher):
+            return {"success": False, "reason": "Thiếu callback lấy OTP Canva"}
+        code = str(otp_fetcher(code_requested_at) or "").strip()
+        if not code:
+            return {"success": False, "reason": "Không lấy được OTP Canva"}
+
+        _canva_human_pause(0.5, 1.0)
+        robust_fill_input(driver, otp_input, code, label="OTP Canva")
+        log_func(f"✅ Canva: đã nhập OTP {code}")
+
+        if not _canva_click(
+            driver,
+            [
+                '//button[contains(normalize-space(.), "Tiếp tục")]',
+                '//button[contains(normalize-space(.), "Continue")]',
+            ],
+            "Tiếp tục sau OTP",
+            timeout=10,
+        ):
+            return {"success": False, "reason": "Không bấm được Tiếp tục sau OTP Canva"}
+
+        deadline = time.time() + 25
+        while time.time() < deadline:
+            try:
+                current_url = driver.current_url or ""
+            except Exception:
+                current_url = ""
+            if any(marker in current_url for marker in ("/template", "/design", "/vi_vn/")) and "redeem" not in current_url:
+                break
+            time.sleep(0.4)
+
+        log_func("🌐 Canva: đang vào trang redeem...")
+        driver.get("https://www.canva.com/redeem/")
+        _wait_for_url_or_dom_settle(driver, timeout=12, stable_for=1.0)
+        _canva_human_pause(0.8, 1.4)
+
+        redeem_input = _canva_wait_visible_input(
+            driver,
+            [
+                'input[placeholder*="mã giảm giá" i]',
+                'input[aria-label*="mã giảm giá" i]',
+                'input[name*="code" i]',
+                'input[type="text"]',
+            ],
+            timeout=15,
+        )
+        if not redeem_input:
+            return {"success": False, "reason": "Không thấy ô nhập mã giảm giá Canva"}
+
+        _canva_human_pause(0.5, 1.0)
+        robust_fill_input(driver, redeem_input, promo_code, label="mã quà Canva")
+        log_func(f"✅ Canva: đã nhập mã {promo_code}")
+
+        if not _canva_click(
+            driver,
+            [
+                '//button[contains(normalize-space(.), "Đổi mã giảm giá của tôi")]',
+                '//button[contains(normalize-space(.), "Redeem")]',
+            ],
+            "Đổi mã giảm giá",
+            timeout=12,
+        ):
+            return {"success": False, "reason": "Không bấm được Đổi mã giảm giá Canva"}
+
+        momo_option = _canva_find_clickable(
+            driver,
+            [
+                '//*[self::label or self::div or self::button][contains(normalize-space(.), "MoMo")]',
+            ],
+            timeout=20,
+        )
+        if momo_option:
+            try:
+                momo_option.click()
+            except Exception:
+                driver.execute_script("arguments[0].click();", momo_option)
+            log_func("✅ Canva: đã chọn MoMo")
+
+        if not _canva_click(
+            driver,
+            [
+                '//button[contains(normalize-space(.), "Nhận ưu đãi")]',
+                '//button[contains(normalize-space(.), "Claim offer")]',
+            ],
+            "Nhận ưu đãi",
+            timeout=15,
+        ):
+            return {"success": False, "reason": "Không bấm được Nhận ưu đãi Canva"}
+
+        return {
+            "success": True,
+            "email": email,
+            "promo_code": promo_code,
+            "payment_method": "MoMo",
+        }
+    except Exception as e:
+        return {"success": False, "reason": f"Lỗi Canva: {e}"}
 
 
 def check_and_handle_error(driver, max_retries=None):
@@ -2289,6 +2799,1364 @@ def _wait_for_2fa_dialog_progress(driver, timeout_seconds=4.0):
     return _wait_until(timeout_seconds, _probe, interval=0.2)
 
 
+def complete_gopay_checkout_and_capture_redirect(driver, checkout_url: str, log_func=None, otp_callback=None):
+    if log_func is None:
+        log_func = print
+
+    checkout_url = str(checkout_url or "").strip()
+    if not checkout_url:
+        return {"success": False, "reason": "Thiếu checkout_url"}
+
+    def _log_local(message):
+        log_func(message)
+
+    def _visible_xpath(xpath):
+        try:
+            return [el for el in driver.find_elements(By.XPATH, xpath) if el.is_displayed()]
+        except Exception:
+            return []
+
+    def _current_url():
+        try:
+            return str(driver.current_url or "").strip()
+        except Exception:
+            return ""
+
+    def _body_text():
+        try:
+            return str(driver.execute_script("return document.body ? (document.body.innerText || document.body.textContent || '') : ''") or "")
+        except Exception:
+            return ""
+
+    def _click_first(elements):
+        for el in elements:
+            try:
+                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                try:
+                    el.click()
+                except Exception:
+                    driver.execute_script("arguments[0].click();", el)
+                return True
+            except Exception:
+                continue
+        return False
+
+    def _click_first_xpath(label, *xpaths):
+        for xpath in xpaths:
+            elements = _visible_xpath(xpath)
+            if not elements:
+                continue
+            if _click_first(elements):
+                _log_local(f"   🔘 Đã bấm {label}")
+                return True
+        return False
+
+    def _click_midtrans_primary_button(button_text, label=None):
+        label = label or button_text
+        try:
+            info = driver.execute_script(
+                """
+                const wanted = String(arguments[0] || '').trim().toLowerCase();
+                const norm = (s) => String(s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                const nodes = Array.from(document.querySelectorAll('button, [role="button"], input[type="button"], input[type="submit"], a'));
+                const candidates = [];
+                for (const node of nodes) {
+                    if (!node || node.offsetParent === null) continue;
+                    const text = norm(node.innerText || node.textContent || node.value || node.getAttribute('aria-label') || '');
+                    if (text !== wanted) continue;
+                    const rect = node.getBoundingClientRect();
+                    if (!rect || rect.width < 80 || rect.height < 36) continue;
+                    const style = window.getComputedStyle(node);
+                    const bg = String(style.backgroundColor || '');
+                    const color = String(style.color || '');
+                    const area = rect.width * rect.height;
+                    const score =
+                        (rect.top * 1000) +
+                        area +
+                        (bg.includes('rgb(56') || bg.includes('rgb(57') || bg.includes('rgb(58') || bg.includes('rgb(59') || bg.includes('rgb(60') || bg.includes('rgb(38') || bg.includes('rgb(39') || bg.includes('rgb(40') || bg.includes('rgb(41') || bg.includes('rgb(42') ? 50000 : 0) +
+                        (color.includes('255') ? 10000 : 0);
+                    candidates.push({
+                        text,
+                        top: rect.top,
+                        left: rect.left,
+                        width: rect.width,
+                        height: rect.height,
+                        score,
+                        bg,
+                    });
+                }
+                if (!candidates.length) return null;
+                candidates.sort((a, b) => b.score - a.score);
+                const best = candidates[0];
+                return {
+                    cx: best.left + (best.width / 2),
+                    cy: best.top + (best.height / 2),
+                    width: best.width,
+                    height: best.height,
+                    top: best.top,
+                    bg: best.bg,
+                };
+                """,
+                button_text,
+            )
+        except Exception:
+            info = None
+
+        if not info:
+            return False
+
+        try:
+            driver.execute_cdp_cmd("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": info["cx"], "y": info["cy"], "button": "left", "buttons": 1})
+            driver.execute_cdp_cmd("Input.dispatchMouseEvent", {"type": "mousePressed", "x": info["cx"], "y": info["cy"], "button": "left", "buttons": 1, "clickCount": 1})
+            driver.execute_cdp_cmd("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": info["cx"], "y": info["cy"], "button": "left", "buttons": 1, "clickCount": 1})
+            _log_local(f"   🔘 Đã bấm {label} (primary button): top={round(float(info.get('top') or 0), 1)}, bg={info.get('bg')}")
+            return True
+        except Exception:
+            return False
+
+    def _fill_first_xpath(label, value, *xpaths):
+        for xpath in xpaths:
+            elements = _visible_xpath(xpath)
+            if not elements:
+                continue
+            if robust_fill_input(driver, elements[0], value, label=label):
+                _log_local(f"   ✍️ Đã điền {label}: {value}")
+                return True
+        return False
+
+    def _fill_midtrans_digit_value(label, value):
+        value = str(value or "").strip()
+        if not value:
+            return False
+        selectors = [
+            'input[type="tel"]',
+            'input[inputmode="numeric"]',
+            'input[autocomplete="one-time-code"]',
+            'input[maxlength="6"]',
+            'input',
+        ]
+        for selector in selectors:
+            try:
+                elements = _visible_elements(driver, selector)
+            except Exception:
+                elements = []
+            for el in elements:
+                try:
+                    if robust_fill_input(driver, el, value, label=label):
+                        _log_local(f"   ✍️ Đã điền {label}: {value}")
+                        return True
+                except Exception:
+                    continue
+        try:
+            ActionChains(driver).send_keys(value).perform()
+            _log_local(f"   ✍️ Đã gửi phím cho {label}: {value}")
+            return True
+        except Exception:
+            return False
+
+    def _wait_midtrans_state(timeout=20):
+        deadline = time.time() + timeout
+        last = {"url": _current_url(), "text": _body_text().lower()}
+        while time.time() < deadline:
+            url = _current_url()
+            text = _body_text().lower()
+            state = {
+                "url": url,
+                "text": text,
+                "is_linking": "#/gopay-tokenization/linking" in url,
+                "is_pay": "#/gopay-tokenization/pay" in url,
+                "has_phone_input": "phone number" in text or "nomor" in text,
+                "has_technical_error": "technical error" in text,
+                "has_hubungkan": "hubungkan gopay" in text or "\nhubungkan\n" in text or "hubungkan" in text,
+                "has_otp": "otp dikirim" in text or "masukkin otp" in text,
+                "has_pin": "6 digit pin" in text or "pin gopay" in text or "silakan ketik 6 digit pin" in text,
+                "has_back_to_openai": "kembali ke openai llc" in text,
+                "has_bayar": "\nbayar\n" in text or "metode bayar" in text,
+                "has_payment_success": "pembayaran berhasil" in text,
+                "has_link_success": "berhasil menghubungkan" in text,
+            }
+            if any(
+                state[key]
+                for key in (
+                    "has_phone_input",
+                    "has_technical_error",
+                    "has_hubungkan",
+                    "has_otp",
+                    "has_pin",
+                    "has_back_to_openai",
+                    "has_bayar",
+                    "has_payment_success",
+                    "has_link_success",
+                )
+            ):
+                return state
+            last = state
+            time.sleep(0.2)
+        return last
+
+    def _complete_midtrans_tokenization_flow():
+        phone_number = "85804088929"
+        gopay_pin = "240905"
+        link_and_pay_attempts = 0
+        phone_number_filled = False
+        hubungkan_clicked = False
+        linking_back_clicked = False
+        bayar_clicked = False
+        payment_back_clicked = False
+
+        def _wait_for_redirect_out(timeout=20):
+            deadline = time.time() + timeout
+            last_url = _current_url()
+            while time.time() < deadline:
+                url = _current_url()
+                if url and "app.midtrans.com/snap/v4/redirection/" not in url:
+                    return url
+                last_url = url
+                time.sleep(0.25)
+            return last_url
+
+        def _wait_after_link_and_pay(timeout=12):
+            deadline = time.time() + timeout
+            last_state = _wait_midtrans_state(timeout=1.5)
+            while time.time() < deadline:
+                state = _wait_midtrans_state(timeout=1.5)
+                if (
+                    state.get("has_technical_error")
+                    or state.get("has_hubungkan")
+                    or state.get("has_otp")
+                    or state.get("has_pin")
+                    or state.get("has_link_success")
+                    or state.get("has_back_to_openai")
+                    or state.get("has_bayar")
+                    or state.get("has_payment_success")
+                    or state.get("is_pay")
+                ):
+                    return state
+                last_state = state
+                time.sleep(0.25)
+            return last_state
+
+        _log_local("   🌐 Đã vào luồng Midtrans trực tiếp, bắt đầu xử lý tokenization GoPay...")
+        phase = "linking"
+        safety_limit = 30
+        for _step in range(safety_limit):
+            state = _wait_midtrans_state(timeout=15)
+            text = state.get("text") or ""
+
+            if state.get("has_technical_error"):
+                _log_local("   ⚠️ Midtrans báo technical error, bấm Back rồi sẽ thử Link and pay lại chậm")
+                if not _click_first_xpath("Back", "//button[normalize-space()='Back' or normalize-space()='Kembali']"):
+                    return {"success": False, "reason": "Midtrans technical error nhưng không bấm được Back"}
+                time.sleep(1.6)
+                continue
+
+            if state.get("has_phone_input"):
+                if not phone_number_filled:
+                    _fill_first_xpath(
+                        "số điện thoại GoPay",
+                        phone_number,
+                        "//input[@type='tel']",
+                        "//input[@inputmode='numeric']",
+                        "//input",
+                    )
+                    phone_number_filled = True
+                    time.sleep(0.35)
+                link_and_pay_attempts += 1
+                if not _click_first_xpath(
+                    "Link and pay",
+                    "//button[normalize-space()='Link and pay']",
+                    "//button[contains(normalize-space(.), 'Link and pay')]",
+                ):
+                    return {"success": False, "reason": "Không bấm được Link and pay"}
+                _log_local(f"   ⏳ Đã bấm Link and pay lần {link_and_pay_attempts}, chờ màn kế tiếp ổn định...")
+                next_state = _wait_after_link_and_pay(timeout=8)
+                if next_state.get("has_phone_input") and not (
+                    next_state.get("has_technical_error")
+                    or next_state.get("has_hubungkan")
+                    or next_state.get("has_otp")
+                    or next_state.get("has_pin")
+                    or next_state.get("has_link_success")
+                    or next_state.get("has_back_to_openai")
+                ):
+                    _log_local("   🔁 Vẫn còn ở màn nhập số, sẽ thử Link and pay lại từ từ")
+                    time.sleep(1.4)
+                continue
+
+            if state.get("has_hubungkan"):
+                if not hubungkan_clicked:
+                    if not (
+                        _click_midtrans_primary_button("Hubungkan", label="Hubungkan")
+                        or _click_first_xpath(
+                            "Hubungkan",
+                            "//button[normalize-space()='Hubungkan']",
+                            "//button[contains(normalize-space(.), 'Hubungkan')]",
+                        )
+                    ):
+                        return {"success": False, "reason": "Không bấm được Hubungkan"}
+                    hubungkan_clicked = True
+                    time.sleep(1.0)
+                continue
+
+            if state.get("has_otp"):
+                if not callable(otp_callback):
+                    return {"success": False, "reason": "Đã tới bước OTP GoPay nhưng chưa có otp_callback"}
+                prompt = "Đã tới bước OTP GoPay. Gửi /otp 123456 để bot nhập mã."
+                otp_code = str(otp_callback(prompt) or "").strip()
+                if not re.fullmatch(r"\d{4,8}", otp_code):
+                    return {"success": False, "reason": f"OTP GoPay không hợp lệ: {otp_code!r}"}
+                if not _fill_midtrans_digit_value("OTP GoPay", otp_code):
+                    return {"success": False, "reason": "Không điền được OTP GoPay"}
+                time.sleep(1.2)
+                continue
+
+            if state.get("has_pin"):
+                if not _fill_midtrans_digit_value("PIN GoPay", gopay_pin):
+                    return {"success": False, "reason": "Không điền được PIN GoPay"}
+                time.sleep(1.2)
+                continue
+
+            if state.get("has_link_success") and phase == "linking":
+                if not linking_back_clicked:
+                    if not _click_first_xpath(
+                        "Kembali ke OpenAI LLC",
+                        "//button[contains(normalize-space(.), 'Kembali ke OpenAI LLC')]",
+                        "//button[contains(normalize-space(.), 'OpenAI LLC')]",
+                    ):
+                        return {"success": False, "reason": "Không bấm được Kembali ke OpenAI LLC sau khi liên kết"}
+                    linking_back_clicked = True
+                phase = "pay"
+                time.sleep(1.2)
+                continue
+
+            if state.get("has_bayar") or state.get("is_pay"):
+                if not bayar_clicked:
+                    if not (
+                        _click_midtrans_primary_button("Bayar", label="Bayar")
+                        or _click_first_xpath(
+                            "Bayar",
+                            "//button[normalize-space()='Bayar']",
+                            "//button[contains(normalize-space(.), 'Bayar')]",
+                        )
+                    ):
+                        return {"success": False, "reason": "Không bấm được Bayar"}
+                    bayar_clicked = True
+                    time.sleep(1.2)
+                continue
+
+            if state.get("has_payment_success"):
+                if not payment_back_clicked:
+                    _click_first_xpath(
+                        "Kembali ke OpenAI LLC",
+                        "//button[contains(normalize-space(.), 'Kembali ke OpenAI LLC')]",
+                        "//button[contains(normalize-space(.), 'OpenAI LLC')]",
+                    )
+                    payment_back_clicked = True
+                final_url = _wait_for_redirect_out(timeout=12)
+                return {"success": True, "redirect_url": final_url or _current_url()}
+
+            if state.get("has_back_to_openai"):
+                if not payment_back_clicked:
+                    _click_first_xpath(
+                        "Kembali ke OpenAI LLC",
+                        "//button[contains(normalize-space(.), 'Kembali ke OpenAI LLC')]",
+                        "//button[contains(normalize-space(.), 'OpenAI LLC')]",
+                    )
+                    payment_back_clicked = True
+                final_url = _wait_for_redirect_out(timeout=12)
+                return {"success": True, "redirect_url": final_url or _current_url()}
+
+            if "openai llc" in text and "rp 1" in text and "bayar" in text:
+                if not bayar_clicked:
+                    if not (
+                        _click_midtrans_primary_button("Bayar", label="Bayar")
+                        or _click_first_xpath(
+                            "Bayar",
+                            "//button[normalize-space()='Bayar']",
+                            "//button[contains(normalize-space(.), 'Bayar')]",
+                        )
+                    ):
+                        return {"success": False, "reason": "Không bấm được Bayar ở màn OpenAI LLC"}
+                    bayar_clicked = True
+                    time.sleep(1.2)
+                continue
+
+        return {"success": False, "reason": f"Vượt quá số bước Midtrans an toàn. URL hiện tại: {_current_url()}"}
+
+    def _has_save_address_prompt():
+        try:
+            return bool(driver.execute_script(
+                """
+                const text = (document.body ? document.body.innerText : '').toLowerCase();
+                return text.includes('lưu địa chỉ') || text.includes('save address');
+                """
+            ))
+        except Exception:
+            return False
+
+    def _dismiss_save_address_prompt():
+        try:
+            for xpath in (
+                "//button[normalize-space()='Không, cảm ơn' or normalize-space()='No thanks' or normalize-space()='Not now']",
+                "//button[@aria-label='Close' or @aria-label='Đóng' or @title='Close' or @title='Đóng']",
+            ):
+                for btn in _visible_xpath(xpath):
+                    try:
+                        driver.execute_script("arguments[0].click();", btn)
+                        _log_local("   🧹 Đã đóng popup lưu địa chỉ")
+                        return True
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        try:
+            ActionChains(driver).pause(0.03).send_keys(Keys.ESCAPE).pause(0.03).send_keys(Keys.ESCAPE).perform()
+        except Exception:
+            pass
+        return not _has_save_address_prompt()
+
+    def _dismiss_save_address_prompt_native():
+        script = """
+        tell application "Google Chrome" to activate
+        delay 0.1
+        tell application "System Events"
+            tell process "Google Chrome"
+                set frontmost to true
+                set targetNames to {"Không, cảm ơn", "No thanks", "Not now"}
+                set blockedNames to {"Lưu", "Save", "Lưu địa chỉ", "Save address"}
+                repeat with targetName in targetNames
+                    try
+                        repeat with uiElem in (entire contents of window 1)
+                            try
+                                set uiName to ""
+                                try
+                                    set uiName to (name of uiElem) as text
+                                end try
+                                if uiName is not "" then
+                                    set isBlocked to false
+                                    repeat with blockedName in blockedNames
+                                        if uiName is (blockedName as text) or uiName contains (blockedName as text) then
+                                            set isBlocked to true
+                                            exit repeat
+                                        end if
+                                    end repeat
+                                    if isBlocked then
+                                        error "blocked"
+                                    end if
+                                end if
+                                if uiName is (targetName as text) then
+                                    click uiElem
+                                    return "clicked:" & uiName
+                                end if
+                            end try
+                        end repeat
+                    end try
+                end repeat
+            end tell
+        end tell
+        return "notfound"
+        """
+        try:
+            result = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            output = str((result.stdout or "").strip())
+            if result.returncode == 0 and output.startswith("clicked:"):
+                _log_local(f"   🧹 Đã đóng popup lưu địa chỉ native: {output}")
+                return True
+        except Exception as e:
+            _log_local(f"   ⚠️ Native dismiss popup lỗi: {e}")
+        return False
+
+    def _native_click_front_chrome_button(button_names, partial_names=None, timeout=5):
+        button_names = list(button_names or [])
+        partial_names = list(partial_names or [])
+        names_literal = ", ".join(json.dumps(str(item)) for item in button_names) or '""'
+        partial_literal = ", ".join(json.dumps(str(item)) for item in partial_names) or '""'
+        blocked_literal = ", ".join(
+            json.dumps(str(item))
+            for item in ("Lưu", "Save", "Lưu địa chỉ", "Save address", "Không, cảm ơn", "No thanks", "Not now")
+        ) or '""'
+        script = f"""
+        set targetNames to {{{names_literal}}}
+        set partialNames to {{{partial_literal}}}
+        set blockedNames to {{{blocked_literal}}}
+        tell application "Google Chrome" to activate
+        delay 0.1
+        tell application "System Events"
+            tell process "Google Chrome"
+                set frontmost to true
+                repeat with uiElem in (entire contents of window 1)
+                    try
+                        set uiName to ""
+                        try
+                            set uiName to (name of uiElem) as text
+                        end try
+                        if uiName is not "" then
+                            set isBlocked to false
+                            repeat with blockedName in blockedNames
+                                if uiName is (blockedName as text) or uiName contains (blockedName as text) then
+                                    set isBlocked to true
+                                    exit repeat
+                                end if
+                            end repeat
+                            if isBlocked then
+                                error "blocked"
+                            end if
+                            repeat with targetName in targetNames
+                                if uiName is (targetName as text) then
+                                    click uiElem
+                                    return "clicked:" & uiName
+                                end if
+                            end repeat
+                            repeat with partialName in partialNames
+                                if uiName contains (partialName as text) then
+                                    click uiElem
+                                    return "clicked:" & uiName
+                                end if
+                            end repeat
+                        end if
+                    end try
+                end repeat
+            end tell
+        end tell
+        return "notfound"
+        """
+        try:
+            result = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            output = str((result.stdout or "").strip())
+            if result.returncode == 0 and output.startswith("clicked:"):
+                return True, output
+        except Exception as e:
+            return False, str(e)
+        return False, "notfound"
+
+    def _native_click_subscribe_button():
+        return _native_click_front_chrome_button(
+            button_names=["Subscribe", "Confirm subscription", "Confirm", "Pay now", "Complete purchase"],
+            partial_names=["Subscribe", "Confirm", "Pay now", "Complete"],
+            timeout=6,
+        )
+
+    def _wait_for_save_address_prompt(timeout=2.5):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if _has_save_address_prompt():
+                return True
+            time.sleep(0.12)
+        return False
+
+    def _wait_and_dismiss_native_save_prompt(timeout=2.5):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if _dismiss_save_address_prompt_native():
+                return True
+            time.sleep(0.18)
+        return False
+
+    def _wait_register_effect(timeout=2.0):
+        deadline = time.time() + timeout
+        last_state = {}
+        while time.time() < deadline:
+            try:
+                state = driver.execute_script(
+                    """
+                    const href = String(window.location.href || '');
+                    const btn = document.querySelector('button[data-testid="hosted-payment-submit-button"]')
+                      || document.querySelector('button[type="submit"]');
+                    const bodyText = (document.body ? document.body.innerText : '').toLowerCase();
+                    const savePrompt = bodyText.includes('lưu địa chỉ') || bodyText.includes('save address');
+                    const resources = performance.getEntriesByType ? performance.getEntriesByType('resource') : [];
+                    const resourceCount = resources.length || 0;
+                    const lastResource = resourceCount ? String(resources[resourceCount - 1].name || '') : '';
+                    if (href.startsWith('https://app.midtrans.com/snap/v4/redirection/')) {
+                      return {accepted: true, reason: 'midtrans-redirect', href, savePrompt, resourceCount, lastResource};
+                    }
+                    if (!btn) {
+                      return {accepted: true, reason: 'button-disappeared', href, savePrompt, resourceCount, lastResource};
+                    }
+                    const currentTextEl = btn.querySelector('.SubmitButton-Text--current');
+                    const processingTextEl = btn.querySelector('[data-testid="submit-button-processing-label"]');
+                    const text = (
+                      (currentTextEl && (currentTextEl.innerText || currentTextEl.textContent))
+                      || btn.innerText
+                      || btn.textContent
+                      || ''
+                    ).trim().toLowerCase();
+                    const processingLabel = (
+                      (processingTextEl && (processingTextEl.innerText || processingTextEl.textContent))
+                      || ''
+                    ).trim().toLowerCase();
+                    const cls = String(btn.className || '').toLowerCase();
+                    const disabled = !!btn.disabled
+                      || String(btn.getAttribute('disabled') || '').toLowerCase() === 'true'
+                      || String(btn.getAttribute('aria-disabled') || '').toLowerCase() === 'true';
+                    const ariaBusy = String(btn.getAttribute('aria-busy') || '').toLowerCase() === 'true';
+                    const processingVisible = !!processingTextEl && processingTextEl.getAttribute('aria-hidden') === 'false';
+                    const currentHidden = !!currentTextEl && currentTextEl.getAttribute('aria-hidden') === 'true';
+                    const stateChanged = disabled
+                      || ariaBusy
+                      || processingVisible
+                      || currentHidden
+                      || text.includes('processing')
+                      || processingLabel.includes('processing')
+                      || cls.includes('processing')
+                      || cls.includes('submitting')
+                      || cls.includes('loading');
+                    return {accepted: stateChanged || savePrompt, reason: savePrompt ? 'save-address-prompt' : (stateChanged ? 'button-state-changed' : 'no-change'), href, savePrompt, text, processingLabel, cls, disabled, ariaBusy, processingVisible, currentHidden, resourceCount, lastResource};
+                    """
+                ) or {}
+            except Exception as e:
+                last_state = {"accepted": False, "reason": f"state-check-error: {e}"}
+                time.sleep(0.1)
+                continue
+            last_state = state
+            if state.get("accepted"):
+                return state
+            time.sleep(0.1)
+        return last_state
+
+    def _fill_visible(selector, value, label):
+        elements = _visible_elements(driver, selector)
+        if not elements:
+            return False
+        return bool(robust_fill_input(driver, elements[0], value, label=label))
+
+    def _fill_gopay_address_batch(billing):
+        try:
+            result = driver.execute_script(
+                """
+                const billing = arguments[0] || {};
+                const norm = (s) => String(s || '').trim().toLowerCase();
+                const setValue = (el, value) => {
+                  if (!el) return false;
+                  const proto = Object.getPrototypeOf(el);
+                  const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+                  if (setter) setter.call(el, value);
+                  else el.value = value;
+                  el.dispatchEvent(new Event('input', { bubbles: true }));
+                  el.dispatchEvent(new Event('change', { bubbles: true }));
+                  el.dispatchEvent(new Event('blur', { bubbles: true }));
+                  return true;
+                };
+                const setSelect = (selectors, desiredValues) => {
+                  for (const selector of selectors) {
+                    const el = document.querySelector(selector);
+                    if (!el || el.offsetParent === null) continue;
+                    const options = Array.from(el.options || []);
+                    const wanted = desiredValues.map(norm);
+                    const match = options.find(opt => {
+                      const text = norm(opt.text);
+                      const value = norm(opt.value);
+                      return wanted.includes(text) || wanted.includes(value) || wanted.some(w => text.includes(w));
+                    });
+                    if (!match) continue;
+                    el.value = match.value;
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    el.dispatchEvent(new Event('blur', { bubbles: true }));
+                    return true;
+                  }
+                  return false;
+                };
+                const fillMap = [
+                  { key: 'name', selectors: ['input#billingName', 'input[name="billingName"]', 'input[name="name"]'] },
+                  { key: 'address1', selectors: ['input#billingAddressLine1', 'input[name="billingAddressLine1"]', 'input[name*="address1" i]'] },
+                  { key: 'address2', selectors: ['input#billingAddressLine2', 'input[name="billingAddressLine2"]', 'input[name*="address2" i]'] },
+                  { key: 'city', selectors: ['input#billingLocality', 'input[name="billingLocality"]', 'input[name*="city" i]'] },
+                  { key: 'zip', selectors: ['input#billingPostalCode', 'input[name="billingPostalCode"]', 'input[name*="zip" i]', 'input[name*="postal" i]'] },
+                ];
+                const filled = {};
+                for (const item of fillMap) {
+                  const value = String(billing[item.key] || '');
+                  if (!value && item.key !== 'address2') continue;
+                  let ok = false;
+                  for (const selector of item.selectors) {
+                    const el = document.querySelector(selector);
+                    if (!el || el.offsetParent === null) continue;
+                    ok = setValue(el, value);
+                    if (ok) break;
+                  }
+                  filled[item.key] = ok;
+                }
+                filled.country = setSelect(
+                  ['select#billingCountry', 'select[name="billingCountry"]', 'select[name*="country" i]', 'select[autocomplete="country"]'],
+                  ['US', 'United States', 'Hoa Kỳ', 'Mỹ']
+                );
+                filled.state = setSelect(
+                  ['select#billingAdministrativeArea', 'select[name="billingAdministrativeArea"]', 'select[name*="state" i]', 'select[id*="state" i]', 'select[name*="province" i]'],
+                  [String(billing.state || '')]
+                );
+                return filled;
+                """,
+                billing,
+            ) or {}
+        except Exception as e:
+            _log_local(f"   ⚠️ Batch-fill địa chỉ GoPay lỗi: {e}")
+            return {}
+
+        required_keys = ("name", "address1", "city", "zip")
+        success = all(bool(result.get(key)) for key in required_keys)
+        if success:
+            _log_local(f"   ✅ Đã batch-fill địa chỉ GoPay: {result}")
+        else:
+            _log_local(f"   ⚠️ Batch-fill GoPay chưa đủ field, sẽ fallback thường: {result}")
+        return result
+
+    def _choose_gopay():
+        def _is_gopay_selected_stripe():
+            try:
+                return bool(driver.execute_script(
+                    """
+                    const selected = document.querySelector(
+                      '.gopay-accordion-item.PaymentMethodFormAccordionItem--selected, ' +
+                      '#payment-method-accordion-item-title-gopay[aria-checked="true"], ' +
+                      'input[name="payment-method-accordion-item-title"][value="gopay"][aria-checked="true"]'
+                    );
+                    return !!(selected && selected.offsetParent !== null);
+                    """
+                ))
+            except Exception:
+                return False
+
+        def _click_exact_gopay_nodes():
+            exact_button_selector = 'button[data-testid="gopay-accordion-item-button"][aria-label="Pay with GoPay"]'
+            for el in _visible_elements(driver, exact_button_selector):
+                try:
+                    _log_local("   🔎 Thử click nút GoPay exact Stripe button")
+                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                    try:
+                        el.click()
+                    except Exception:
+                        driver.execute_script("arguments[0].click();", el)
+                    try:
+                        ActionChains(driver).move_to_element(el).pause(0.05).click().perform()
+                    except Exception:
+                        pass
+                    try:
+                        el.send_keys(Keys.SPACE)
+                    except Exception:
+                        pass
+                    try:
+                        el.send_keys(Keys.ENTER)
+                    except Exception:
+                        pass
+                    if (_is_gopay_selected_stripe() or _is_gopay_selected()) and _wait_until(2.5, _wait_for_gopay_form, interval=0.15):
+                        return True
+                except Exception:
+                    continue
+
+            css_selectors = [
+                '.gopay-accordion-item.PaymentMethodFormAccordionItem--selected',
+                '.gopay-accordion-item .AccordionItemHeader--clickable',
+                '.gopay-accordion-item .AccordionItemHeader',
+                'button[data-testid="gopay-accordion-item-button"]',
+                'button[aria-label="Pay with GoPay"]',
+                'input#payment-method-accordion-item-title-gopay',
+                'input[name="payment-method-accordion-item-title"][value="gopay"]',
+                '#payment-method-label-gopay',
+                '.PaymentMethodFormAccordionItemTitle-selected',
+            ]
+            for selector in css_selectors:
+                exact_nodes = _visible_elements(driver, selector)
+                if exact_nodes:
+                    _log_local(f"   🔎 Thử click GoPay bằng selector: {selector} ({len(exact_nodes)} node)")
+                for el in exact_nodes:
+                    try:
+                        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                        try:
+                            el.click()
+                        except Exception:
+                            driver.execute_script("arguments[0].click();", el)
+                        try:
+                            el.send_keys(Keys.SPACE)
+                        except Exception:
+                            pass
+                        try:
+                            el.send_keys(Keys.ENTER)
+                        except Exception:
+                            pass
+                        try:
+                            ActionChains(driver).move_to_element(el).pause(0.05).click().perform()
+                        except Exception:
+                            pass
+                        if _is_gopay_selected_stripe() and _wait_until(2.5, _wait_for_gopay_form, interval=0.15):
+                            return True
+                        if _wait_until(2.5, _wait_for_gopay_form, interval=0.15):
+                            return True
+                    except Exception:
+                        continue
+            return False
+
+        def _click_gopay_row_center():
+            try:
+                clicked = driver.execute_script(
+                    """
+                    const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                    const rows = Array.from(document.querySelectorAll('label, div, section'))
+                        .filter((node) => node && node.offsetParent !== null)
+                        .filter((node) => norm(node.innerText || node.textContent || '') === 'gopay' || norm(node.innerText || node.textContent || '').includes('\\ngopay') || norm(node.innerText || node.textContent || '').includes(' gopay'));
+
+                    const dispatchAtPoint = (x, y) => {
+                        const target = document.elementFromPoint(x, y);
+                        if (!target) return false;
+                        const events = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
+                        for (const name of events) {
+                            target.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, clientX: x, clientY: y, view: window }));
+                        }
+                        return true;
+                    };
+
+                    for (const row of rows) {
+                        const rect = row.getBoundingClientRect();
+                        if (!rect || rect.width < 40 || rect.height < 20) continue;
+                        const x = rect.left + 18;
+                        const y = rect.top + (rect.height / 2);
+                        if (dispatchAtPoint(x, y)) return true;
+                    }
+                    return false;
+                    """
+                )
+                return bool(clicked)
+            except Exception:
+                return False
+
+        if _is_gopay_selected_stripe() and _wait_until(1.5, _wait_for_gopay_form, interval=0.15):
+            _log_local("   ✅ GoPay đã ở trạng thái selected sẵn")
+            return True
+
+        if _click_exact_gopay_nodes():
+            return True
+
+        # Try semantic radio/label combinations first.
+        radio_xpaths = [
+            '//input[@type="radio"]/ancestor::label[.//*[contains(normalize-space(.), "GoPay")] or contains(normalize-space(.), "GoPay")]',
+            '//*[@id="payment-method-label-gopay"]/ancestor::*[self::div or self::label][1]',
+            '//*[@data-testid="gopay-accordion-item-button"]/ancestor::*[self::div or self::section][1]',
+            '//label[.//*[contains(normalize-space(.), "GoPay")] or contains(normalize-space(.), "GoPay")]',
+            '//*[self::div or self::section][.//*[contains(normalize-space(.), "GoPay")] and (.//input[@type="radio"] or .//*[@role="radio"])]',
+            '//input[@type="radio"]/ancestor::*[self::label or self::div][.//*[contains(normalize-space(.), "GoPay")] or contains(normalize-space(.), "GoPay")]',
+        ]
+        _log_local("   🔎 Fallback click vùng radio GoPay...")
+        if _click_gopay_row_center() and _wait_until(2.5, _wait_for_gopay_form, interval=0.15):
+            return True
+        for xpath in radio_xpaths:
+            rows = _visible_xpath(xpath)
+            if not rows:
+                continue
+            _log_local(f"   🔎 Fallback XPath GoPay: {xpath} ({len(rows)} node)")
+            if _click_first(rows):
+                if (_is_gopay_selected_stripe() or _is_gopay_selected()) and _wait_until(2.0, _wait_for_gopay_form, interval=0.15):
+                    return True
+            for row in rows:
+                try:
+                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", row)
+                    ActionChains(driver).move_to_element_with_offset(row, 18, max(5, int(row.size.get("height", 40) / 2))).click().perform()
+                    if (_is_gopay_selected_stripe() or _is_gopay_selected()) and _wait_until(2.0, _wait_for_gopay_form, interval=0.15):
+                        return True
+                except Exception:
+                    continue
+
+        try:
+            clicked = driver.execute_script(
+                """
+                const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                const dispatchMouseClick = (target) => {
+                    if (!target) return false;
+                    const events = ['mouseover', 'mousemove', 'mousedown', 'mouseup', 'click'];
+                    for (const name of events) {
+                        target.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, view: window }));
+                    }
+                    return true;
+                };
+
+                const nodes = Array.from(document.querySelectorAll('label, div, button, section'));
+                for (const node of nodes) {
+                    if (!node || node.offsetParent === null) continue;
+                    const text = norm(node.innerText || node.textContent || '');
+                    if (!text.includes('gopay')) continue;
+
+                    const rect = node.getBoundingClientRect();
+                    const x = Math.max(rect.left + 20, 5);
+                    const y = rect.top + (rect.height / 2);
+                    const pointTarget = document.elementFromPoint(x, y);
+                    if (dispatchMouseClick(pointTarget)) return true;
+
+                    const radio = node.querySelector('input[type="radio"], [role="radio"]');
+                    if (dispatchMouseClick(radio)) return true;
+                    if (dispatchMouseClick(node)) return true;
+                }
+                return false;
+                """
+            )
+            if not clicked:
+                return False
+            return bool((_is_gopay_selected_stripe() or _is_gopay_selected()) and _wait_until(2.5, _wait_for_gopay_form, interval=0.15))
+        except Exception:
+            return False
+
+    def _is_gopay_selected():
+        try:
+            return bool(driver.execute_script(
+                """
+                const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                const nodes = Array.from(document.querySelectorAll('label, div, section'));
+                for (const node of nodes) {
+                    if (!node || node.offsetParent === null) continue;
+                    const text = norm(node.innerText || node.textContent || '');
+                    if (!text.includes('gopay')) continue;
+
+                    const radio = node.querySelector('input[type="radio"], [role="radio"]');
+                    if (radio) {
+                        if (radio.checked === true) return true;
+                        if ((radio.getAttribute('aria-checked') || '').toLowerCase() === 'true') return true;
+                        if ((radio.getAttribute('data-state') || '').toLowerCase() === 'checked') return true;
+                    }
+
+                    if ((node.getAttribute('aria-checked') || '').toLowerCase() === 'true') return true;
+                    if ((node.getAttribute('data-state') || '').toLowerCase() === 'checked') return true;
+                }
+                return false;
+                """
+            ))
+        except Exception:
+            return False
+
+    def _wait_for_gopay_form():
+        def _probe():
+            try:
+                return driver.execute_script(
+                    """
+                    const selectors = [
+                        'input#billingName',
+                        'select#billingCountry',
+                        'input#billingAddressLine1',
+                        'input#billingLocality',
+                        'input#billingPostalCode',
+                        'select#billingAdministrativeArea',
+                        'select[autocomplete="country"]',
+                        'select[name*="country" i]',
+                        'button[aria-haspopup="listbox"][id*="country" i]',
+                        '[role="combobox"][aria-label*="country" i]',
+                        'input[name*="address1" i]',
+                        'input[placeholder="Address line 1"]',
+                        'input[placeholder="Dòng địa chỉ 1"]',
+                        'input[name*="city" i]',
+                        'input[placeholder="City"]',
+                        'input[placeholder="ZIP"]',
+                    ];
+                    if (selectors.some((selector) => {
+                        const el = document.querySelector(selector);
+                        return el && el.offsetParent !== null;
+                    })) {
+                        return true;
+                    }
+                    return false;
+                    """
+                )
+            except Exception:
+                return False
+
+        return bool(_wait_until(8, _probe, interval=0.25))
+
+    def _select_us_country():
+        # Native select first
+        select_candidates = _visible_elements(
+            driver,
+            'select#billingCountry, select[name="billingCountry"], select[name*="country" i], select[id*="country" i], select[autocomplete="country"]'
+        )
+        for select_el in select_candidates:
+            try:
+                driver.execute_script(
+                    """
+                    const el = arguments[0];
+                    const desired = ['US', 'United States', 'Hoa Kỳ', 'Mỹ'];
+                    const options = Array.from(el.options || []);
+                    const match = options.find(opt => desired.includes((opt.value || '').trim()) || desired.includes((opt.text || '').trim()));
+                    if (!match) return false;
+                    el.value = match.value;
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    return true;
+                    """,
+                    select_el,
+                )
+                return True
+            except Exception:
+                continue
+
+        # Custom dropdown fallback
+        dropdown_candidates = _visible_elements(
+            driver,
+            'button[aria-haspopup="listbox"], [role="combobox"], [data-testid*="country" i]'
+        )
+        for dropdown in dropdown_candidates:
+            try:
+                label_text = (dropdown.text or "").strip().lower()
+            except Exception:
+                label_text = ""
+            if label_text and not any(token in label_text for token in ("country", "quốc gia", "hoa kỳ", "united", "indonesia", "indo")):
+                continue
+            try:
+                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", dropdown)
+                try:
+                    dropdown.click()
+                except Exception:
+                    driver.execute_script("arguments[0].click();", dropdown)
+                time.sleep(0.25)
+                options = _visible_xpath(
+                    '//*[self::div or self::button or self::span][contains(normalize-space(.), "United States") or contains(normalize-space(.), "Hoa Kỳ") or contains(normalize-space(.), "Mỹ")]'
+                )
+                if _click_first(options):
+                    return True
+            except Exception:
+                continue
+
+        dropdowns = _visible_xpath(
+            '//*[self::button or self::div][contains(normalize-space(.), "Hoa Kỳ") or contains(normalize-space(.), "United States") or contains(normalize-space(.), "Mỹ")]'
+        )
+        if _click_first(dropdowns):
+            return True
+        return False
+
+    def _select_state(state_value):
+        select_candidates = _visible_elements(
+            driver,
+            'select#billingAdministrativeArea, select[name="billingAdministrativeArea"], select[name*="state" i], select[id*="state" i], select[name*="province" i]'
+        )
+        for select_el in select_candidates:
+            try:
+                driver.execute_script(
+                    """
+                    const el = arguments[0];
+                    const desired = String(arguments[1] || '').trim().toLowerCase();
+                    const options = Array.from(el.options || []);
+                    const match = options.find(opt => {
+                        const text = String(opt.text || '').trim().toLowerCase();
+                        const value = String(opt.value || '').trim().toLowerCase();
+                        return text === desired || value === desired || text.includes(desired);
+                    });
+                    if (!match) return false;
+                    el.value = match.value;
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    return true;
+                    """,
+                    select_el,
+                    state_value,
+                )
+                return True
+            except Exception:
+                continue
+        return _fill_visible('input[name*="state" i], input[id*="state" i]', state_value, "tiểu bang")
+
+    def _ensure_terms_checked():
+        exact_selectors = [
+            '#termsOfServiceConsentCheckbox',
+            'input[name="termsOfServiceConsentCheckbox"]',
+        ]
+        for selector in exact_selectors:
+            for box in _visible_elements(driver, selector):
+                try:
+                    checked = str(box.get_attribute("checked") or "").lower() in {"true", "checked"}
+                    if not checked:
+                        try:
+                            box.click()
+                        except Exception:
+                            driver.execute_script("arguments[0].click();", box)
+                    return True
+                except Exception:
+                    continue
+
+        try:
+            return bool(driver.execute_script(
+                """
+                const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                const exact = document.querySelector('#termsOfServiceConsentCheckbox, input[name="termsOfServiceConsentCheckbox"]');
+                if (exact && exact.offsetParent !== null) {
+                    const checked = exact.checked === true || exact.getAttribute('aria-checked') === 'true';
+                    if (!checked) {
+                        try { exact.click(); } catch (_err) {}
+                    }
+                    return true;
+                }
+                const boxes = Array.from(document.querySelectorAll('input[type="checkbox"], [role="checkbox"]'))
+                    .filter(el => el && el.offsetParent !== null);
+                for (const box of boxes) {
+                    const container = box.closest('label, div, section') || box.parentElement || box;
+                    const text = norm(container.innerText || container.textContent || '');
+                    if (text.includes('save my information') || text.includes('faster checkout') || text.includes('lưu thông tin')) continue;
+                    if (!text.includes('điều khoản') && !text.includes('terms') && !text.includes('phí của bạn')) continue;
+                    const checked = box.checked === true || box.getAttribute('aria-checked') === 'true';
+                    if (!checked) {
+                        try { box.click(); } catch (_err) {
+                            try { container.click(); } catch (_err2) {}
+                        }
+                    }
+                    return true;
+                }
+                return false;
+                """
+            ))
+        except Exception:
+            return False
+
+    def _click_register():
+        last_click_meta = {"ok": False, "method": None, "state": None}
+
+        def _success(method_name, state):
+            last_click_meta["ok"] = True
+            last_click_meta["method"] = method_name
+            last_click_meta["state"] = state
+            return dict(last_click_meta)
+
+        def _collect_register_buttons():
+            buttons_local = _visible_elements(driver, 'button[data-testid="hosted-payment-submit-button"]')
+            if not buttons_local:
+                buttons_local = _visible_xpath(
+                    '//button[contains(normalize-space(.), "Đăng ký") or contains(normalize-space(.), "Register") or contains(normalize-space(.), "Subscribe")]'
+                )
+            if not buttons_local:
+                buttons_local = _visible_elements(driver, 'button[type="submit"]')
+            return buttons_local
+
+        def _physical_surface_click_local(button):
+            try:
+                rect = button.rect or {}
+            except Exception:
+                rect = {}
+            width = max(float(rect.get("width") or 0), 1.0)
+            height = max(float(rect.get("height") or 0), 1.0)
+            points = (
+                (width * 0.50, height * 0.50, "center"),
+                (width * 0.28, height * 0.50, "left-center"),
+                (width * 0.72, height * 0.50, "right-center"),
+            )
+            for offset_x, offset_y, label in points:
+                try:
+                    driver.execute_script("arguments[0].scrollIntoView({block:'center', inline:'center'});", button)
+                except Exception:
+                    pass
+                try:
+                    ActionChains(driver).move_to_element_with_offset(
+                        button,
+                        int(offset_x - (width / 2)),
+                        int(offset_y - (height / 2)),
+                    ).pause(0.03).click().perform()
+                    return True, label
+                except Exception:
+                    continue
+            return False, "no-physical-point"
+
+        max_retries = 5
+        for retry_idx in range(max_retries):
+            buttons = _collect_register_buttons()
+            if not buttons:
+                _log_local(f"   ⚠️ Không tìm thấy nút Đăng ký ở vòng retry {retry_idx + 1}/{max_retries}")
+                time.sleep(0.35)
+                continue
+
+            for btn_idx, btn in enumerate(buttons[:3], start=1):
+                attempt_label = f"{retry_idx + 1}/{max_retries}.{btn_idx}"
+                try:
+                    driver.execute_script("arguments[0].scrollIntoView({block:'center', inline:'center'});", btn)
+                except Exception:
+                    pass
+                time.sleep(0.1)
+
+                try:
+                    double_click_auth_button(driver, btn)
+                    state = _wait_register_effect(timeout=2.0)
+                    _log_local(f"   🔘 Double click Đăng ký lần {attempt_label}: {state}")
+                    if state.get("reason") == "save-address-prompt":
+                        _dismiss_save_address_prompt()
+                        continue
+                    if state.get("accepted") and _wait_for_save_address_prompt(timeout=1.8):
+                        _log_local("   🪟 Popup lưu địa chỉ xuất hiện sau cú double click, sẽ đóng và bấm lại")
+                        _dismiss_save_address_prompt()
+                        continue
+                    if state.get("accepted"):
+                        return _success("double-click", state)
+                except Exception:
+                    pass
+
+                try:
+                    clicked, detail = _physical_surface_click_local(btn)
+                    if clicked:
+                        state = _wait_register_effect(timeout=2.0)
+                        _log_local(f"   🔘 Physical click Đăng ký lần {attempt_label} ({detail}): {state}")
+                        if state.get("reason") == "save-address-prompt":
+                            _dismiss_save_address_prompt()
+                            continue
+                        if state.get("accepted") and _wait_for_save_address_prompt(timeout=1.8):
+                            _log_local("   🪟 Popup lưu địa chỉ xuất hiện sau physical click, sẽ đóng và bấm lại")
+                            _dismiss_save_address_prompt()
+                            continue
+                        if state.get("accepted"):
+                            return _success(f"physical-{detail}", state)
+                except Exception:
+                    pass
+
+                try:
+                    rect = driver.execute_script(
+                        """
+                        const r = arguments[0].getBoundingClientRect();
+                        return {cx: r.left + (r.width / 2), cy: r.top + (r.height / 2), width: r.width, height: r.height};
+                        """,
+                        btn,
+                    )
+                    if rect and rect.get("width", 0) > 0 and rect.get("height", 0) > 0:
+                        driver.execute_cdp_cmd("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": rect["cx"], "y": rect["cy"], "button": "left", "buttons": 1})
+                        driver.execute_cdp_cmd("Input.dispatchMouseEvent", {"type": "mousePressed", "x": rect["cx"], "y": rect["cy"], "button": "left", "buttons": 1, "clickCount": 1})
+                        driver.execute_cdp_cmd("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": rect["cx"], "y": rect["cy"], "button": "left", "buttons": 1, "clickCount": 1})
+                        state = _wait_register_effect(timeout=2.0)
+                        _log_local(f"   🔘 CDP click Đăng ký lần {attempt_label}: {state}")
+                        if state.get("reason") == "save-address-prompt":
+                            _dismiss_save_address_prompt()
+                            continue
+                        if state.get("accepted") and _wait_for_save_address_prompt(timeout=1.8):
+                            _log_local("   🪟 Popup lưu địa chỉ xuất hiện sau CDP click, sẽ đóng và bấm lại")
+                            _dismiss_save_address_prompt()
+                            continue
+                        if state.get("accepted"):
+                            return _success("cdp-center", state)
+                except Exception:
+                    pass
+
+                try:
+                    driver.execute_script("arguments[0].focus();", btn)
+                    btn.send_keys(Keys.SPACE)
+                    state = _wait_register_effect(timeout=1.5)
+                    _log_local(f"   🔘 Space Đăng ký lần {attempt_label}: {state}")
+                    if state.get("reason") == "save-address-prompt":
+                        _dismiss_save_address_prompt()
+                        continue
+                    if state.get("accepted") and _wait_for_save_address_prompt(timeout=1.8):
+                        _log_local("   🪟 Popup lưu địa chỉ xuất hiện sau Space, sẽ đóng và bấm lại")
+                        _dismiss_save_address_prompt()
+                        continue
+                    if state.get("accepted"):
+                        return _success("space", state)
+                except Exception:
+                    pass
+
+                try:
+                    driver.execute_script("arguments[0].scrollIntoView({block:'center', inline:'center'});", btn)
+                    time.sleep(0.15)
+                    btn.click()
+                    state = _wait_register_effect(timeout=2.0)
+                    _log_local(f"   🔘 Native btn.click Đăng ký lần {attempt_label}: {state}")
+                    if state.get("reason") == "save-address-prompt":
+                        _dismiss_save_address_prompt()
+                        continue
+                    if state.get("accepted") and _wait_for_save_address_prompt(timeout=1.8):
+                        _log_local("   🪟 Popup lưu địa chỉ xuất hiện sau btn.click, sẽ đóng và bấm lại")
+                        _dismiss_save_address_prompt()
+                        continue
+                    if state.get("accepted"):
+                        return _success("native-btn-click", state)
+                except Exception:
+                    pass
+
+                try:
+                    driver.execute_script("arguments[0].scrollIntoView({block:'center', inline:'center'});", btn)
+                    time.sleep(0.15)
+                    driver.execute_script("arguments[0].click();", btn)
+                    state = _wait_register_effect(timeout=2.0)
+                    _log_local(f"   🔘 JS click Đăng ký lần {attempt_label}: {state}")
+                    if state.get("reason") == "save-address-prompt":
+                        _dismiss_save_address_prompt()
+                        continue
+                    if state.get("accepted") and _wait_for_save_address_prompt(timeout=1.8):
+                        _log_local("   🪟 Popup lưu địa chỉ xuất hiện sau JS click, sẽ đóng và bấm lại")
+                        _dismiss_save_address_prompt()
+                        continue
+                    if state.get("accepted"):
+                        return _success("js-click", state)
+                except Exception:
+                    pass
+
+            time.sleep(0.25)
+
+        return dict(last_click_meta)
+
+    _log_local("   🌐 Đang mở checkout_url để xử lý GoPay...")
+    try:
+        driver.get(checkout_url)
+    except Exception as e:
+        return {"success": False, "reason": f"Mở checkout_url thất bại: {e}"}
+
+    _wait_for_url_or_dom_settle(driver, previous_url=checkout_url, timeout=8, stable_for=0.5)
+    time.sleep(1.2)
+
+    if _current_url().startswith("https://app.midtrans.com/snap/v4/redirection/"):
+        return _complete_midtrans_tokenization_flow()
+
+    # Chọn GoPay
+    if not _choose_gopay():
+        return {"success": False, "reason": "Không chọn được GoPay"}
+    if not _wait_for_gopay_form():
+        return {"success": False, "reason": "Đã chọn GoPay nhưng form địa chỉ chưa hiện ra"}
+    _log_local("   ✅ Đã chọn GoPay")
+    _log_local("   ✅ Form GoPay đã hiện, bắt đầu điền địa chỉ")
+
+    billing = generate_billing_info("US")
+    batch_result = _fill_gopay_address_batch(billing)
+    if not batch_result.get("name"):
+        _fill_visible('input#billingName, input[name="billingName"], input[name="name"], input[placeholder="Tên"], input[placeholder="Name"]', billing["name"], "tên GoPay")
+    if not batch_result.get("country"):
+        _select_us_country()
+    if not batch_result.get("address1"):
+        _fill_visible('input#billingAddressLine1, input[name="billingAddressLine1"], input[placeholder="Dòng địa chỉ 1"], input[placeholder="Address line 1"], input[name*="address1" i]', billing["address1"], "địa chỉ 1")
+    if not batch_result.get("address2"):
+        _fill_visible('input#billingAddressLine2, input[name="billingAddressLine2"], input[placeholder="Dòng địa chỉ 2"], input[placeholder="Address line 2"], input[name*="address2" i]', "", "địa chỉ 2")
+    if not batch_result.get("city"):
+        _fill_visible('input#billingLocality, input[name="billingLocality"], input[placeholder="Thành phố"], input[placeholder="City"], input[name*="city" i]', billing["city"], "thành phố")
+    if not batch_result.get("zip"):
+        _fill_visible('input#billingPostalCode, input[name="billingPostalCode"], input[placeholder="ZIP"], input[name*="zip" i], input[name*="postal" i]', billing["zip"], "zip")
+    if not batch_result.get("state"):
+        _select_state(billing["state"])
+    _log_local("   ✅ Đã điền địa chỉ US cho GoPay")
+
+    if _ensure_terms_checked():
+        _log_local("   ✅ Đã tick điều khoản")
+    else:
+        _log_local("   ⚠️ Không xác nhận được checkbox điều khoản, vẫn thử submit")
+
+    register_click = _click_register()
+    if not register_click.get("ok"):
+        return {"success": False, "reason": "Không bấm được nút Đăng ký"}
+    _log_local(f"   ✅ Đã bấm Đăng ký bằng {register_click.get('method')}: {register_click.get('state')}")
+
+    def _wait_midtrans():
+        current_url = ""
+        try:
+            current_url = driver.current_url or ""
+        except Exception:
+            current_url = ""
+        if current_url.startswith("https://app.midtrans.com/snap/v4/redirection/"):
+            return current_url
+        return None
+
+    redirect_url = _wait_until(20, _wait_midtrans, interval=0.25)
+    if redirect_url:
+        _log_local(f"   ✅ Đã bắt được link Midtrans: {redirect_url}")
+        return _complete_midtrans_tokenization_flow()
+
+    try:
+        current_url = driver.current_url or ""
+    except Exception:
+        current_url = ""
+    return {"success": False, "reason": f"Không bắt được URL Midtrans sau khi đăng ký. URL hiện tại: {current_url}"}
+
+
 def setup_two_factor_auth(driver, password: str, log_func=None):
     """Best-effort bật 2FA cho ChatGPT sau khi checkout mới đã xong."""
     if log_func is None:
@@ -2296,6 +4164,15 @@ def setup_two_factor_auth(driver, password: str, log_func=None):
 
     log_func("   🔐 Bắt đầu setup 2FA...")
     try:
+        log_func("   🧹 Dọn sạch onboarding/modal còn sót trước khi vào Settings...")
+        dismiss_chatgpt_obstacles_until_clear(
+            driver,
+            max_passes=6,
+            rounds_per_pass=8,
+            settle_seconds=1.0,
+            log_func=log_func,
+        )
+
         def is_security_panel_open():
             try:
                 current_url = (driver.current_url or "").lower()
@@ -2600,25 +4477,6 @@ def setup_two_factor_auth(driver, password: str, log_func=None):
                 }
 
                 const visibleSwitches = Array.from(document.querySelectorAll('button[role="switch"], [role="switch"], input[type="checkbox"]'))
-                    .filter((el) => el && el.offsetParent !== null);
-                if (visibleSwitches.length > 0) {
-                    const first = visibleSwitches[0];
-                    try { first.scrollIntoView({ block: 'center', behavior: 'instant' }); } catch (_err) {}
-                    if (!isChecked(first)) {
-                        try { first.click(); } catch (_err) {
-                            try {
-                                first.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-                            } catch (_err2) {}
-                        }
-                    }
-                    return {
-                        found: true,
-                        clicked: !isChecked(first),
-                        already_checked: isChecked(first),
-                        method: 'gpt1-first-visible-switch'
-                    };
-                }
-
                 return { found: false, clicked: false, already_checked: false, method: 'none' };
             """
             try:
@@ -2702,18 +4560,6 @@ def setup_two_factor_auth(driver, password: str, log_func=None):
                     }
                 }
 
-                const visibleSwitches = Array.from(document.querySelectorAll('button[role="switch"], [role="switch"], input[type="checkbox"]'))
-                    .filter((el) => el && el.offsetParent !== null);
-                if (visibleSwitches.length > 0) {
-                    const first = visibleSwitches[0];
-                    return {
-                        found: true,
-                        clicked: isChecked(first) ? false : clickEl(first),
-                        already_checked: isChecked(first),
-                        method: "first-visible-switch-fallback",
-                    };
-                }
-
                 return { found: false, clicked: false, already_checked: false, method: "none" };
             """
             try:
@@ -2770,6 +4616,46 @@ def setup_two_factor_auth(driver, password: str, log_func=None):
                 pass
             time.sleep(0.4)
 
+        def is_twofa_enabled_now():
+            try:
+                result = driver.execute_script(
+                    """
+                    const norm = (s) => String(s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                    const bodyText = norm(document.body && (document.body.innerText || document.body.textContent || ''));
+                    const positiveHints = [
+                      'backup code',
+                      'backup codes',
+                      'recovery code',
+                      'recovery codes',
+                      'mã dự phòng',
+                      'authenticator app',
+                      'ứng dụng xác thực'
+                    ];
+                    if (positiveHints.some((item) => bodyText.includes(item))) return true;
+
+                    const switches = Array.from(document.querySelectorAll('button[role="switch"], [role="switch"], input[type="checkbox"]'));
+                    for (const sw of switches) {
+                      if (!sw || sw.offsetParent === null) continue;
+                      const aria = norm(sw.getAttribute && sw.getAttribute('aria-checked'));
+                      const state = norm(sw.getAttribute && sw.getAttribute('data-state'));
+                      if (aria === 'true' || state === 'checked') return true;
+                    }
+
+                    const buttons = Array.from(document.querySelectorAll('button, [role="button"], a'));
+                    for (const btn of buttons) {
+                      if (!btn || btn.offsetParent === null) continue;
+                      const text = norm(btn.innerText || btn.textContent || btn.getAttribute('aria-label') || '');
+                      if (text.includes('disable') || text.includes('turn off') || text.includes('tắt')) return true;
+                      if (text.includes('backup code') || text.includes('recovery code') || text.includes('mã dự phòng')) return true;
+                    }
+
+                    return false;
+                    """
+                )
+                return bool(result)
+            except Exception:
+                return False
+
         direct_toggle_result = direct_gpt1_open_and_toggle()
         if direct_toggle_result and direct_toggle_result.get("found"):
             enable_button = True
@@ -2811,14 +4697,6 @@ def setup_two_factor_auth(driver, password: str, log_func=None):
                 scroll_security_view(step=300)
                 time.sleep(0.5)
 
-            enable_selectors = [
-                (By.XPATH, '//*[self::button or self::a or @role="button" or self::div or self::span][contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "authenticator app")]'),
-                (By.XPATH, '//*[self::button or self::a or @role="button" or self::div][contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "enable two-factor authentication")]'),
-                (By.XPATH, '//*[self::button or self::a or @role="button" or self::div][contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "set up two-factor authentication")]'),
-                (By.XPATH, '//*[self::button or self::a or @role="button" or self::div][contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "two-factor authentication")]'),
-                (By.XPATH, '//*[self::button or self::a or @role="button" or self::div][contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZÀÁẠẢÃĂẮẰẲẴẶÂẤẦẨẪẬĐÈÉẸẺẼÊẾỀỂỄỆÌÍỊỈĨÒÓỌỎÕÔỐỒỔỖỘƠỚỜỞỠỢÙÚỤỦŨƯỨỪỬỮỰỲÝỴỶỸ", "abcdefghijklmnopqrstuvwxyzàáạảãăắằẳẵặâấầẩẫậđèéẹẻẽêếềểễệìíịỉĩòóọỏõôốồổỗộơớờởỡợùúụủũưứừửữựỳýỵỷỹ"), "bật xác thực hai yếu tố")]'),
-                (By.XPATH, '//*[self::button or self::a or @role="button" or self::div][contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZÀÁẠẢÃĂẮẰẲẴẶÂẤẦẨẪẬĐÈÉẸẺẼÊẾỀỂỄỆÌÍỊỈĨÒÓỌỎÕÔỐỒỔỖỘƠỚỜỞỠỢÙÚỤỦŨƯỨỪỬỮỰỲÝỴỶỸ", "abcdefghijklmnopqrstuvwxyzàáạảãăắằẳẵặâấầẩẫậđèéẹẻẽêếềểễệìíịỉĩòóọỏõôốồổỗộơớờởỡợùúụủũưứừửữựỳýỵỷỹ"), "xác thực hai yếu tố")]'),
-            ]
             enable_button = None
             for scroll_round in range(5):
                 log_func(f"   🔎 Quét mục 2FA ở vị trí cuộn lần {scroll_round + 1}...")
@@ -2870,21 +4748,6 @@ def setup_two_factor_auth(driver, password: str, log_func=None):
                     log_func("   ✅ Tìm thấy dòng Authenticator app, sẽ thử click bật switch")
                     enable_button = auth_switch
                     break
-
-                for by, selector in enable_selectors:
-                    try:
-                        buttons = driver.find_elements(by, selector)
-                    except Exception:
-                        buttons = []
-                    for button in buttons:
-                        try:
-                            if button.is_displayed() and button.is_enabled():
-                                enable_button = button
-                                break
-                        except Exception:
-                            continue
-                    if enable_button:
-                        break
                 if enable_button:
                     break
                 log_func(f"   🔽 Chưa thấy mục bật 2FA, cuộn xuống thêm...")
@@ -2894,6 +4757,16 @@ def setup_two_factor_auth(driver, password: str, log_func=None):
         if 'enable_button' not in locals():
             enable_button = None
         if not enable_button:
+            if is_twofa_enabled_now():
+                log_func("   ✅ 2FA đã ở trạng thái bật, không cần bật lại")
+                return {
+                    "success": True,
+                    "verified": True,
+                    "already_enabled": True,
+                    "secret": "",
+                    "backup_codes": [],
+                    "stage": "already_enabled",
+                }
             try:
                 body_text = driver.find_element(By.TAG_NAME, "body").text or ""
                 snippet = "\n".join(line for line in body_text.splitlines() if line.strip())[:1200]
@@ -2939,6 +4812,16 @@ def setup_two_factor_auth(driver, password: str, log_func=None):
 
         secret = _extract_2fa_secret_from_page(driver)
         if not secret:
+            if is_twofa_enabled_now():
+                log_func("   ✅ 2FA đã bật nhưng UI không trả secret, coi như thành công")
+                return {
+                    "success": True,
+                    "verified": True,
+                    "already_enabled": True,
+                    "secret": "",
+                    "backup_codes": [],
+                    "stage": "already_enabled",
+                }
             log_func("   ⚠️ Không lấy được secret key 2FA từ trang")
             return {"success": False, "reason": "Không lấy được secret key"}
 
@@ -2948,6 +4831,16 @@ def setup_two_factor_auth(driver, password: str, log_func=None):
             code_candidates = _visible_elements(driver, 'input[inputmode="numeric"], input[autocomplete="one-time-code"], input[type="text"]')
             code_input = code_candidates[0] if code_candidates else None
         if not code_input:
+            if is_twofa_enabled_now():
+                log_func("   ✅ 2FA đã bật, không còn cần ô nhập mã xác minh")
+                return {
+                    "success": True,
+                    "verified": True,
+                    "already_enabled": True,
+                    "secret": secret,
+                    "backup_codes": [],
+                    "stage": "already_enabled",
+                }
             return {"success": False, "reason": "Không tìm thấy ô nhập mã 2FA"}
 
         current_ts = int(time.time())
@@ -2980,6 +4873,16 @@ def setup_two_factor_auth(driver, password: str, log_func=None):
             break
 
         if not verified:
+            if is_twofa_enabled_now():
+                log_func("   ✅ 2FA có vẻ đã bật dù không bắt được trạng thái verify rõ ràng")
+                return {
+                    "success": True,
+                    "verified": True,
+                    "already_enabled": True,
+                    "secret": secret,
+                    "backup_codes": [],
+                    "stage": "already_enabled",
+                }
             return {"success": False, "reason": f"Không verify được mã 2FA local: {last_code}"}
 
         backup_codes = _collect_2fa_backup_codes(driver)
@@ -2994,6 +4897,7 @@ def setup_two_factor_auth(driver, password: str, log_func=None):
             "backup_codes": backup_codes,
             "verified": True,
             "stage": "verified",
+            "source_email": "",
         }
     except Exception as e:
         log_func(f"   ❌ Lỗi setup 2FA: {e}")
@@ -3307,10 +5211,15 @@ def fill_signup_form(driver, email: str, password: str):
                     print("⚠️ Sau Continue bị trả về trang có nút Đăng ký/Đăng nhập, sẽ bấm lại và nhập mail lại")
                     break
 
-                if state == "email_still_visible" and detail and time.time() - same_state_since >= 4:
+                # Auth0/OpenAI đôi lúc vẫn giữ ô email vài giây trong lúc chuyển sang bước mật khẩu.
+                # Chỉ kết luận "kẹt ở email" sau khi trạng thái này đứng yên đủ lâu.
+                if state == "email_still_visible" and detail and time.time() - same_state_since >= 8:
                     break
 
-                if state == "email_still_visible" and not detail and time.time() - same_state_since >= 12:
+                if state == "email_still_visible" and not detail and time.time() - same_state_since >= 18:
+                    break
+
+                if state == "loading" and time.time() - same_state_since >= 18:
                     break
 
                 if state == "home" and time.time() - same_state_since >= 8:
@@ -3319,8 +5228,16 @@ def fill_signup_form(driver, email: str, password: str):
                 time.sleep(0.25)
 
             if code_input or inline_form_detected:
-                print("✅ Trang đã chuyển sang bước OTP, bỏ qua bước mật khẩu")
-                return True
+                print("⚠️ Flow đang nhảy thẳng vào OTP trước bước mật khẩu, sẽ ép retry lại để tránh tạo account bằng OTP-only")
+                if email_attempt + 1 < max_email_attempts:
+                    try:
+                        driver.get("https://chatgpt.com/auth/login")
+                        _wait_for_url_or_dom_settle(driver, timeout=8, stable_for=0.8)
+                    except Exception:
+                        pass
+                    continue
+                print("❌ Sau nhiều lần thử vẫn bị nhảy vào OTP trước mật khẩu, coi như flow đăng ký lỗi")
+                return False
 
             if password_input:
                 break
@@ -4167,6 +6084,37 @@ def dismiss_chatgpt_onboarding_if_present(driver, max_rounds=5):
             break
 
     return clicked_any
+
+
+def dismiss_chatgpt_obstacles_until_clear(driver, max_passes=6, rounds_per_pass=8, settle_seconds=1.2, log_func=None):
+    """Dọn liên tục các popup/onboarding cho đến khi ổn định vài nhịp liền."""
+    if log_func is None:
+        log_func = print
+
+    cleared_any = False
+    stable_passes = 0
+
+    for pass_idx in range(max(1, int(max_passes))):
+        try:
+            driver.switch_to.default_content()
+        except Exception:
+            pass
+
+        log_func(f"🧹 Quét chướng ngại vật lần {pass_idx + 1}/{max_passes}...")
+        dismissed = dismiss_chatgpt_onboarding_if_present(driver, max_rounds=rounds_per_pass)
+        if dismissed:
+            cleared_any = True
+            stable_passes = 0
+            time.sleep(max(0.4, float(settle_seconds)))
+            continue
+
+        stable_passes += 1
+        if stable_passes >= 2:
+            log_func("✅ Không còn chướng ngại vật đáng kể, có thể tiếp tục")
+            break
+        time.sleep(max(0.4, float(settle_seconds)))
+
+    return cleared_any
 
 
 def is_inline_registration_form(driver):
@@ -6083,6 +8031,147 @@ def subscribe_plus_trial(driver):
 
         # Tạo thông tin hóa đơn ngẫu nhiên theo quốc gia tương ứng
         billing_info = generate_billing_info(current_country_code)
+
+        def disable_checkout_autofill_prompts():
+            try:
+                driver.execute_script(
+                    """
+                    const docs = [document];
+                    for (const iframe of Array.from(document.querySelectorAll('iframe'))) {
+                        try {
+                            if (iframe.contentDocument) docs.push(iframe.contentDocument);
+                        } catch (_err) {}
+                    }
+                    for (const doc of docs) {
+                        for (const form of Array.from(doc.querySelectorAll('form'))) {
+                            try {
+                                form.setAttribute('autocomplete', 'off');
+                                form.setAttribute('data-lpignore', 'true');
+                            } catch (_err) {}
+                        }
+                        for (const el of Array.from(doc.querySelectorAll('input, select, textarea, button'))) {
+                            try {
+                                el.setAttribute('autocomplete', 'off');
+                                el.setAttribute('autocorrect', 'off');
+                                el.setAttribute('autocapitalize', 'off');
+                                el.setAttribute('spellcheck', 'false');
+                                el.setAttribute('data-form-type', 'other');
+                                el.setAttribute('data-lpignore', 'true');
+                            } catch (_err) {}
+                        }
+                    }
+                    """
+                )
+                return True
+            except Exception:
+                return False
+
+        print("🧹 Tắt autocomplete/autofill trên form checkout...")
+        if disable_checkout_autofill_prompts():
+            print("  ✅ Đã khử gợi ý autofill của browser trên DOM")
+        else:
+            print("  ⚠️ Không khử được autofill trên DOM, vẫn tiếp tục")
+
+        def dismiss_save_address_prompt():
+            closed = False
+            try:
+                buttons = driver.find_elements(
+                    By.XPATH,
+                    "//button[normalize-space()='Không, cảm ơn' or normalize-space()='No thanks' or normalize-space()='Not now']",
+                )
+                for btn in buttons:
+                    try:
+                        if btn.is_displayed():
+                            driver.execute_script("arguments[0].click();", btn)
+                            print("  🧹 Đã đóng popup lưu địa chỉ bằng nút từ chối")
+                            return True
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            try:
+                close_buttons = driver.find_elements(
+                    By.XPATH,
+                    "//button[@aria-label='Close' or @aria-label='Đóng' or @title='Close' or @title='Đóng']",
+                )
+                for btn in close_buttons:
+                    try:
+                        if btn.is_displayed():
+                            driver.execute_script("arguments[0].click();", btn)
+                            print("  🧹 Đã đóng popup lưu địa chỉ bằng nút X")
+                            return True
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            try:
+                ActionChains(driver).pause(0.03).send_keys(Keys.ESCAPE).pause(0.03).send_keys(Keys.ESCAPE).perform()
+                body_text = (_read_body_text(driver) or "").lower()
+                if "lưu địa chỉ" not in body_text and "save address" not in body_text:
+                    print("  🧹 Đã gửi ESC để dọn popup lưu địa chỉ")
+                    closed = True
+            except Exception:
+                pass
+
+            return closed
+
+        def has_save_address_prompt_visible():
+            try:
+                return bool(
+                    driver.execute_script(
+                        """
+                        const text = (document.body ? document.body.innerText : '').toLowerCase();
+                        return text.includes('lưu địa chỉ') || text.includes('save address');
+                        """
+                    )
+                )
+            except Exception:
+                return False
+
+        def ensure_save_address_prompt_closed(timeout=3.0):
+            deadline = time.time() + timeout
+            saw_prompt = False
+            while time.time() < deadline:
+                visible = has_save_address_prompt_visible()
+                if not visible:
+                    if saw_prompt:
+                        print("  ✅ Popup lưu địa chỉ đã biến mất")
+                    return True
+                saw_prompt = True
+                dismissed = dismiss_save_address_prompt()
+                if not dismissed:
+                    try:
+                        ActionChains(driver).pause(0.03).send_keys(Keys.ESCAPE).pause(0.03).send_keys(Keys.ESCAPE).perform()
+                    except Exception:
+                        pass
+                time.sleep(0.2)
+            print("  ⚠️ Popup lưu địa chỉ vẫn còn sau khi thử đóng")
+            return False
+
+        def fill_checkout_text_field(element, value, field_label):
+            try:
+                element.clear()
+            except Exception:
+                pass
+            try:
+                fill_text_fast(driver, element, value)
+            except Exception:
+                type_slowly(element, value)
+            try:
+                driver.execute_script(
+                    """
+                    const el = arguments[0];
+                    el.focus && el.focus();
+                    el.dispatchEvent(new Event('blur', { bubbles: true }));
+                    """,
+                    element,
+                )
+            except Exception:
+                pass
+            print(f"  ✅ Điền {field_label}: {value}")
+            return True
         
         # ============== 2. Điền họ tên ==============
         def fill_name():
@@ -6100,9 +8189,7 @@ def subscribe_plus_trial(driver):
             for s in selectors:
                 el = find_visible(s)
                 if el:
-                    el.clear()
-                    type_slowly(el, billing_info["name"])
-                    return True
+                    return fill_checkout_text_field(el, billing_info["name"], "họ tên")
             return False
             
         print(f"👤 Tìm và điền họ tên: {billing_info['name']}...")
@@ -6114,9 +8201,7 @@ def subscribe_plus_trial(driver):
             # 1. Mã bưu chính (Zip)
             zip_el = find_visible('#Field-postalCodeInput, input[name="postalCode"], input[placeholder="Mã bưu chính"], input[placeholder="Zip code"]')
             if zip_el:
-                zip_el.clear()
-                type_slowly(zip_el, billing_info["zip"])
-                print(f"  ✅ Điền mã bưu chính: {billing_info['zip']}")
+                fill_checkout_text_field(zip_el, billing_info["zip"], "mã bưu chính")
                 
                 # === Sửa quan trọng ===
                 # Sau khi điền mã bưu chính, Stripe thường cần request ngắn để hiện trường City/State
@@ -6132,8 +8217,7 @@ def subscribe_plus_trial(driver):
                         state_el.send_keys(billing_info["state"])
                         state_el.send_keys(Keys.ENTER)
                     else:
-                        state_el.clear()
-                        type_slowly(state_el, billing_info["state"])
+                        fill_text_fast(driver, state_el, billing_info["state"])
                         state_el.send_keys(Keys.ARROW_DOWN)
                         state_el.send_keys(Keys.ENTER)
                     print(f"  ✅ Điền bang/tỉnh: {billing_info['state']}")
@@ -6147,26 +8231,23 @@ def subscribe_plus_trial(driver):
             # 3. Thành phố (City)
             city_el = find_visible('#Field-localityInput, input[name="city"], input[placeholder="Thành phố"], input[placeholder="City"]')
             if city_el:
-                city_el.clear()
-                type_slowly(city_el, billing_info["city"])
-                print(f"  ✅ Điền thành phố: {billing_info['city']}")
+                fill_checkout_text_field(city_el, billing_info["city"], "thành phố")
 
             # 4. Địa chỉ dòng 1
             line1_el = find_visible('#Field-addressLine1Input, input[name="addressLine1"], input[placeholder="Address line 1"]')
             if line1_el:
-                line1_el.clear()
-                type_slowly(line1_el, billing_info["address1"])
+                fill_checkout_text_field(line1_el, billing_info["address1"], "địa chỉ dòng 1")
                 time.sleep(0.5)
                 # Một số popup autocomplete cần nhấn ESC để đóng
                 try: ActionChains(driver).send_keys(Keys.ESCAPE).perform()
                 except: pass
-                print(f"  ✅ Điền địa chỉ dòng 1: {billing_info['address1']}")
                 
             return True
 
         print("🏠 Tìm và điền địa chỉ...")
         run_in_all_frames("Điền địa chỉ", fill_address)
         time.sleep(1)
+        ensure_save_address_prompt_closed()
 
         # ============== 4. Điền thẻ tín dụng ==============
         print("💳 Đang điền thông tin thẻ tín dụng...")
@@ -6190,9 +8271,990 @@ def subscribe_plus_trial(driver):
         if not handle_stripe_input(driver, 'CVC', 'input[name="cvc"], input[name="securityCode"], input[id="cardCvc"], input[placeholder="CVC"]', card["cvc"]):
              print("❌ Nhập CVC thất bại")
 
-        time.sleep(2)
+        def wait_for_tax_ready(min_wait=3.0, timeout=8.0):
+            print(f"⏳ Chờ Stripe tính thuế tối thiểu {min_wait:.1f}s trước khi Subscribe...")
+            start = time.time()
+            time.sleep(min_wait)
+
+            while time.time() - start < timeout:
+                try:
+                    body_text = _read_body_text(driver).lower()
+                except Exception:
+                    body_text = ""
+
+                waiting_markers = (
+                    "enter address to calculate",
+                    "calculating",
+                    "đang tính",
+                )
+                blocking_markers = (
+                    "could not calculate tax",
+                    "we could not calculate tax",
+                )
+
+                if any(marker in body_text for marker in blocking_markers):
+                    print("  ⚠️ Stripe vẫn báo chưa tính được thuế, nhưng sẽ tiếp tục thử submit")
+                    return
+
+                if not any(marker in body_text for marker in waiting_markers):
+                    print("  ✅ Đã qua pha chờ tính thuế")
+                    return
+
+                time.sleep(0.35)
+
+            print("  ⏱️ Hết thời gian chờ thuế, vẫn tiếp tục submit")
+
+        wait_for_tax_ready()
+        ensure_save_address_prompt_closed()
+
+        def wait_for_subscribe_ready(timeout=8.0):
+            print("⏳ Chờ nút Subscribe sẵn sàng để bấm...")
+            start = time.time()
+            last_state = None
+
+            while time.time() - start < timeout:
+                ensure_save_address_prompt_closed(timeout=1.2)
+                try:
+                    state = driver.execute_script(
+                        """
+                        const selectors = [
+                          "button[data-testid='hosted-payment-submit-button']",
+                          "button[type='submit']",
+                          "button[class*='SubmitButton']",
+                          "button[class*='Subscribe']",
+                        ];
+                        let btn = null;
+                        for (const selector of selectors) {
+                          btn = document.querySelector(selector);
+                          if (btn) break;
+                        }
+                        if (!btn) return {found: false};
+                        const currentTextEl = btn.querySelector('.SubmitButton-Text--current');
+                        const processingTextEl = btn.querySelector('[data-testid=\"submit-button-processing-label\"]');
+                        const text = (
+                          (currentTextEl && (currentTextEl.innerText || currentTextEl.textContent))
+                          || btn.innerText
+                          || btn.textContent
+                          || btn.getAttribute('aria-label')
+                          || ''
+                        ).trim().toLowerCase();
+                        const processingLabel = (
+                          (processingTextEl && (processingTextEl.innerText || processingTextEl.textContent))
+                          || ''
+                        ).trim().toLowerCase();
+                        const cls = (btn.className || '').toString().toLowerCase();
+                        const disabled = !!btn.disabled
+                          || String(btn.getAttribute('disabled') || '').toLowerCase() === 'true'
+                          || String(btn.getAttribute('aria-disabled') || '').toLowerCase() === 'true';
+                        const processing = text.includes('processing') || processingLabel.includes('processing') || cls.includes('processing');
+                        const rect = btn.getBoundingClientRect();
+                        return {
+                          found: true,
+                          disabled,
+                          processing,
+                          visible: rect.width > 0 && rect.height > 0,
+                          text,
+                          class_name: cls,
+                        };
+                        """
+                    ) or {}
+                except Exception:
+                    state = {}
+
+                last_state = state
+                if state.get("found") and state.get("visible") and not state.get("disabled") and not state.get("processing"):
+                    print("  ✅ Nút Subscribe đã sẵn sàng")
+                    return True
+
+                time.sleep(0.25)
+
+            print(f"  ⚠️ Hết thời gian chờ Subscribe ready: {last_state}")
+            return False
+
+        wait_for_subscribe_ready()
         
         # ============== 5. Vòng lặp gửi và bổ sung ==============
+        def click_subscribe_button():
+            selectors = (
+                "button[data-testid='hosted-payment-submit-button']",
+                "[data-testid*='subscribe']",
+                "[data-testid*='confirm']",
+                "[data-testid*='submit']",
+                "button[type='submit']",
+                "button[class*='SubmitButton']",
+                "button[class*='Subscribe']",
+                "form button:last-of-type",
+                ".StripeElement button",
+                "button span",
+                "button",
+            )
+            last_error = None
+            max_retries = 8
+            keyword_markers = (
+                "subscribe",
+                "confirm subscription",
+                "confirm",
+                "pay now",
+                "complete purchase",
+                "complete",
+                "continue",
+                "đăng ký",
+                "thanh toán",
+            )
+
+            def _click_center_via_cdp(button):
+                rect = driver.execute_script(
+                    """
+                    const btn = arguments[0];
+                    if (!btn) return null;
+                    btn.scrollIntoView({block: 'center', inline: 'center'});
+                    const r = btn.getBoundingClientRect();
+                    if (!r || r.width <= 0 || r.height <= 0) return null;
+                    const cx = r.left + (r.width / 2);
+                    const cy = r.top + (r.height / 2);
+                    const target = document.elementFromPoint(cx, cy);
+                    return {
+                        left: r.left,
+                        top: r.top,
+                        width: r.width,
+                        height: r.height,
+                        cx,
+                        cy,
+                        center_hits_button: !!target && (target === btn || btn.contains(target)),
+                        center_target: target ? (target.tagName || '') : '',
+                    };
+                    """,
+                    button,
+                )
+                if not rect:
+                    return False, "không lấy được rect"
+
+                if not rect.get("center_hits_button"):
+                    return False, f"tâm nút đang bị che bởi {rect.get('center_target') or 'phần tử khác'}"
+
+                driver.execute_cdp_cmd(
+                    "Input.dispatchMouseEvent",
+                    {"type": "mouseMoved", "x": rect["cx"], "y": rect["cy"], "button": "left", "buttons": 1},
+                )
+                driver.execute_cdp_cmd(
+                    "Input.dispatchMouseEvent",
+                    {"type": "mousePressed", "x": rect["cx"], "y": rect["cy"], "button": "left", "buttons": 1, "clickCount": 1},
+                )
+                driver.execute_cdp_cmd(
+                    "Input.dispatchMouseEvent",
+                    {"type": "mouseReleased", "x": rect["cx"], "y": rect["cy"], "button": "left", "buttons": 1, "clickCount": 1},
+                )
+                return True, f"center=({rect['cx']:.1f}, {rect['cy']:.1f})"
+
+            def _wait_for_submit_effect(timeout=1.2):
+                deadline = time.time() + timeout
+                last_state = {}
+                while time.time() < deadline:
+                    try:
+                        state = driver.execute_script(
+                            """
+                            const btn = document.querySelector("button[data-testid='hosted-payment-submit-button']")
+                              || document.querySelector("button[type='submit']")
+                              || document.querySelector("button[class*='SubmitButton']")
+                              || document.querySelector("button[class*='Subscribe']");
+                            const href = String(window.location.href || '');
+                            const resources = performance.getEntriesByType ? performance.getEntriesByType('resource') : [];
+                            const resourceCount = resources.length || 0;
+                            const lastResource = resourceCount ? String(resources[resourceCount - 1].name || '') : '';
+                            if (!btn) {
+                              return {submitted: true, reason: 'button-disappeared', href, resourceCount, lastResource};
+                            }
+                            const currentTextEl = btn.querySelector('.SubmitButton-Text--current');
+                            const processingTextEl = btn.querySelector('[data-testid="submit-button-processing-label"]');
+                            const text = (
+                              (currentTextEl && (currentTextEl.innerText || currentTextEl.textContent))
+                              || btn.innerText
+                              || btn.textContent
+                              || ''
+                            ).trim().toLowerCase();
+                            const processingLabel = (
+                              (processingTextEl && (processingTextEl.innerText || processingTextEl.textContent))
+                              || ''
+                            ).trim().toLowerCase();
+                            const cls = String(btn.className || '').toLowerCase();
+                            const disabled = !!btn.disabled
+                              || String(btn.getAttribute('disabled') || '').toLowerCase() === 'true'
+                              || String(btn.getAttribute('aria-disabled') || '').toLowerCase() === 'true';
+                            const ariaBusy = String(btn.getAttribute('aria-busy') || '').toLowerCase() === 'true';
+                            const processingVisible = !!processingTextEl && processingTextEl.getAttribute('aria-hidden') === 'false';
+                            const currentHidden = !!currentTextEl && currentTextEl.getAttribute('aria-hidden') === 'true';
+                            const submitting = disabled
+                              || ariaBusy
+                              || processingVisible
+                              || currentHidden
+                              || text.includes('processing')
+                              || processingLabel.includes('processing')
+                              || cls.includes('processing')
+                              || cls.includes('submitting')
+                              || cls.includes('loading');
+                            return {
+                              submitted: submitting,
+                              reason: submitting ? 'button-state-changed' : 'no-change',
+                              text,
+                              processingLabel,
+                              disabled,
+                              ariaBusy,
+                              processingVisible,
+                              currentHidden,
+                              cls,
+                              href,
+                              resourceCount,
+                              lastResource,
+                            };
+                            """
+                        ) or {}
+                    except Exception as e:
+                        last_state = {"submitted": False, "reason": f"state-check-error: {e}"}
+                        time.sleep(0.1)
+                        continue
+
+                    last_state = state
+                    if state.get("submitted"):
+                        return True, state
+                    time.sleep(0.1)
+
+                return False, last_state
+
+            def _strong_js_subscribe_click():
+                return driver.execute_script(
+                    """
+                    const selectors = arguments[0];
+                    const keywords = arguments[1];
+                    const norm = (s) => String(s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                    const isVisible = (el) => {
+                      if (!el) return false;
+                      const r = el.getBoundingClientRect();
+                      return r.width > 0 && r.height > 0 && el.offsetParent !== null;
+                    };
+                    const isEnabled = (el) => {
+                      if (!el) return false;
+                      return !el.disabled
+                        && String(el.getAttribute('disabled') || '').toLowerCase() !== 'true'
+                        && String(el.getAttribute('aria-disabled') || '').toLowerCase() !== 'true';
+                    };
+                    const seen = new Set();
+                    const candidates = [];
+                    for (const selector of selectors) {
+                      let nodes = [];
+                      try {
+                        nodes = Array.from(document.querySelectorAll(selector));
+                      } catch (_err) {
+                        continue;
+                      }
+                      for (let node of nodes) {
+                        if (node && node.tagName === 'SPAN') {
+                          node = node.closest('button');
+                        }
+                        if (!node || seen.has(node)) continue;
+                        seen.add(node);
+                        const text = norm(node.innerText || node.textContent || node.getAttribute('aria-label') || '');
+                        if (selector === 'button' || selector === 'button span' || selector === 'form button:last-of-type') {
+                          if (!keywords.some((kw) => text.includes(kw))) continue;
+                        }
+                        if (!isVisible(node) || !isEnabled(node)) continue;
+                        candidates.push({node, selector, text});
+                      }
+                    }
+                    for (const item of candidates) {
+                      const btn = item.node;
+                      btn.scrollIntoView({behavior: 'smooth', block: 'center', inline: 'center'});
+                      const rect = btn.getBoundingClientRect();
+                      const centerX = rect.left + rect.width / 2;
+                      const centerY = rect.top + rect.height / 2;
+                      const opts = {
+                        bubbles: true,
+                        cancelable: true,
+                        view: window,
+                        clientX: centerX,
+                        clientY: centerY,
+                        button: 0,
+                        buttons: 1,
+                      };
+                      for (const type of ['pointerover', 'mouseover', 'pointerenter', 'mouseenter', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                        try { btn.dispatchEvent(new MouseEvent(type, opts)); } catch (_err) {}
+                      }
+                      try { btn.click(); } catch (_err) {}
+                      return {clicked: true, selector: item.selector, text: item.text};
+                    }
+                    return {clicked: false, selector: '', text: ''};
+                    """,
+                    list(selectors),
+                    list(keyword_markers),
+                )
+
+            def _find_subscribe_button_in_current_context():
+                try:
+                    return driver.execute_script(
+                        """
+                        const selectors = arguments[0];
+                        const keywords = arguments[1];
+                        const norm = (s) => String(s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                        const isVisible = (el) => {
+                          if (!el) return false;
+                          const r = el.getBoundingClientRect();
+                          return r.width > 0 && r.height > 0 && el.offsetParent !== null;
+                        };
+                        const isEnabled = (el) => {
+                          if (!el) return false;
+                          return !el.disabled
+                            && String(el.getAttribute('disabled') || '').toLowerCase() !== 'true'
+                            && String(el.getAttribute('aria-disabled') || '').toLowerCase() !== 'true';
+                        };
+                        const seen = new Set();
+                        for (const selector of selectors) {
+                          let nodes = [];
+                          try {
+                            nodes = Array.from(document.querySelectorAll(selector));
+                          } catch (_err) {
+                            continue;
+                          }
+                          for (let node of nodes) {
+                            if (node && node.tagName === 'SPAN') node = node.closest('button');
+                            if (!node || seen.has(node)) continue;
+                            seen.add(node);
+                            const text = norm(node.innerText || node.textContent || node.getAttribute('aria-label') || '');
+                            if (selector === 'button' || selector === 'button span' || selector === 'form button:last-of-type') {
+                              if (!keywords.some((kw) => text.includes(kw))) continue;
+                            }
+                            if (!isVisible(node) || !isEnabled(node)) continue;
+                            node.scrollIntoView({block: 'center', inline: 'center'});
+                            return node;
+                          }
+                        }
+                        return null;
+                        """,
+                        list(selectors),
+                        list(keyword_markers),
+                    )
+                except Exception:
+                    return None
+
+            def _install_subscribe_anchor_in_current_context():
+                try:
+                    return driver.execute_script(
+                        """
+                        const selectors = arguments[0];
+                        const keywords = arguments[1];
+                        const norm = (s) => String(s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                        const isVisible = (el) => {
+                          if (!el) return false;
+                          const r = el.getBoundingClientRect();
+                          return r.width > 0 && r.height > 0 && el.offsetParent !== null;
+                        };
+                        const isEnabled = (el) => {
+                          if (!el) return false;
+                          return !el.disabled
+                            && String(el.getAttribute('disabled') || '').toLowerCase() !== 'true'
+                            && String(el.getAttribute('aria-disabled') || '').toLowerCase() !== 'true';
+                        };
+                        const findButton = () => {
+                          const seen = new Set();
+                          for (const selector of selectors) {
+                            let nodes = [];
+                            try {
+                              nodes = Array.from(document.querySelectorAll(selector));
+                            } catch (_err) {
+                              continue;
+                            }
+                            for (let node of nodes) {
+                              if (node && node.tagName === 'SPAN') node = node.closest('button');
+                              if (!node || seen.has(node)) continue;
+                              seen.add(node);
+                              const text = norm(node.innerText || node.textContent || node.getAttribute('aria-label') || '');
+                              if (selector === 'button' || selector === 'button span' || selector === 'form button:last-of-type') {
+                                if (!keywords.some((kw) => text.includes(kw))) continue;
+                              }
+                              if (!isVisible(node) || !isEnabled(node)) continue;
+                              return {node, text, selector};
+                            }
+                          }
+                          return null;
+                        };
+                        const found = findButton();
+                        if (!found) return {installed: false};
+                        const btn = found.node;
+                        btn.setAttribute('data-codex-subscribe-anchor-target', 'true');
+                        let anchor = document.getElementById('codex-subscribe-anchor');
+                        if (!anchor) {
+                          anchor = document.createElement('div');
+                          anchor.id = 'codex-subscribe-anchor';
+                          anchor.setAttribute('data-codex-subscribe-anchor', 'true');
+                          anchor.style.position = 'fixed';
+                          anchor.style.pointerEvents = 'none';
+                          anchor.style.zIndex = '2147483646';
+                          anchor.style.border = '2px dashed rgba(255, 90, 90, 0.9)';
+                          anchor.style.background = 'rgba(255, 90, 90, 0.08)';
+                          anchor.style.boxSizing = 'border-box';
+                          anchor.style.borderRadius = '10px';
+                          anchor.style.display = 'block';
+                          document.documentElement.appendChild(anchor);
+                        }
+                        const sync = () => {
+                          const r = btn.getBoundingClientRect();
+                          anchor.style.left = `${r.left}px`;
+                          anchor.style.top = `${r.top}px`;
+                          anchor.style.width = `${r.width}px`;
+                          anchor.style.height = `${r.height}px`;
+                          anchor.setAttribute('data-anchor-text', found.text || '');
+                          anchor.setAttribute('data-anchor-selector', found.selector || '');
+                        };
+                        sync();
+                        try {
+                          if (window.__codexSubscribeAnchorObserver) window.__codexSubscribeAnchorObserver.disconnect();
+                        } catch (_err) {}
+                        try {
+                          if (window.__codexSubscribeAnchorTimer) clearInterval(window.__codexSubscribeAnchorTimer);
+                        } catch (_err) {}
+                        const observer = new MutationObserver(() => sync());
+                        observer.observe(document.documentElement || document.body, {
+                          subtree: true,
+                          childList: true,
+                          attributes: true,
+                          characterData: true,
+                        });
+                        window.__codexSubscribeAnchorObserver = observer;
+                        window.__codexSubscribeAnchorTimer = setInterval(sync, 150);
+                        return {installed: true, text: found.text || '', selector: found.selector || ''};
+                        """,
+                        list(selectors),
+                        list(keyword_markers),
+                    ) or {"installed": False}
+                except Exception:
+                    return {"installed": False}
+
+            def _install_subscribe_anchor_any_context():
+                try:
+                    driver.switch_to.default_content()
+                except Exception:
+                    pass
+                try:
+                    result = _install_subscribe_anchor_in_current_context() or {}
+                    if result.get("installed"):
+                        return result
+                except Exception:
+                    pass
+                frames = []
+                try:
+                    driver.switch_to.default_content()
+                    frames = [frame for frame in driver.find_elements(By.TAG_NAME, "iframe") if frame.is_displayed()]
+                except Exception:
+                    frames = []
+                for idx, frame in enumerate(frames):
+                    try:
+                        driver.switch_to.default_content()
+                        driver.switch_to.frame(frame)
+                        result = _install_subscribe_anchor_in_current_context() or {}
+                        if result.get("installed"):
+                            result["frame_index"] = idx
+                            return result
+                    except Exception:
+                        continue
+                try:
+                    driver.switch_to.default_content()
+                except Exception:
+                    pass
+                return {"installed": False}
+
+            def _find_subscribe_global_rect():
+                try:
+                    driver.switch_to.default_content()
+                except Exception:
+                    pass
+                try:
+                    return driver.execute_script(
+                        """
+                        const selectors = arguments[0];
+                        const keywords = arguments[1];
+                        const norm = (s) => String(s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                        const isVisible = (el) => {
+                          if (!el) return false;
+                          const r = el.getBoundingClientRect();
+                          return r.width > 0 && r.height > 0 && el.offsetParent !== null;
+                        };
+                        const isEnabled = (el) => {
+                          if (!el) return false;
+                          return !el.disabled
+                            && String(el.getAttribute('disabled') || '').toLowerCase() !== 'true'
+                            && String(el.getAttribute('aria-disabled') || '').toLowerCase() !== 'true';
+                        };
+                        const matches = (node, selector) => {
+                          const text = norm(node.innerText || node.textContent || node.getAttribute('aria-label') || '');
+                          if (selector === 'button' || selector === 'button span' || selector === 'form button:last-of-type') {
+                            return keywords.some((kw) => text.includes(kw));
+                          }
+                          return true;
+                        };
+                        const readAnchorRect = (doc, chain) => {
+                          const anchor = doc.getElementById('codex-subscribe-anchor');
+                          if (anchor && anchor.offsetParent !== null) {
+                            const rect = anchor.getBoundingClientRect();
+                            let left = rect.left;
+                            let top = rect.top;
+                            for (const frameEl of chain) {
+                              const fr = frameEl.getBoundingClientRect();
+                              left += fr.left;
+                              top += fr.top;
+                            }
+                            return {
+                              found: true,
+                              selector: anchor.getAttribute('data-anchor-selector') || 'anchor',
+                              text: anchor.getAttribute('data-anchor-text') || '',
+                              left,
+                              top,
+                              width: rect.width,
+                              height: rect.height,
+                              cx: left + (rect.width / 2),
+                              cy: top + (rect.height / 2),
+                              frameDepth: chain.length,
+                              source: 'anchor',
+                            };
+                          }
+                          return null;
+                        };
+                        const findInDoc = (doc, chain) => {
+                          const anchorResult = readAnchorRect(doc, chain);
+                          if (anchorResult) return anchorResult;
+                          const seen = new Set();
+                          for (const selector of selectors) {
+                            let nodes = [];
+                            try {
+                              nodes = Array.from(doc.querySelectorAll(selector));
+                            } catch (_err) {
+                              continue;
+                            }
+                            for (let node of nodes) {
+                              if (node && node.tagName === 'SPAN') node = node.closest('button');
+                              if (!node || seen.has(node)) continue;
+                              seen.add(node);
+                              if (!matches(node, selector) || !isVisible(node) || !isEnabled(node)) continue;
+                              const rect = node.getBoundingClientRect();
+                              let left = rect.left;
+                              let top = rect.top;
+                              for (const frameEl of chain) {
+                                const fr = frameEl.getBoundingClientRect();
+                                left += fr.left;
+                                top += fr.top;
+                              }
+                              return {
+                                found: true,
+                                selector,
+                                text: norm(node.innerText || node.textContent || node.getAttribute('aria-label') || ''),
+                                left,
+                                top,
+                                width: rect.width,
+                                height: rect.height,
+                                cx: left + (rect.width / 2),
+                                cy: top + (rect.height / 2),
+                                frameDepth: chain.length,
+                                source: 'button',
+                              };
+                            }
+                          }
+                          const iframes = Array.from(doc.querySelectorAll('iframe'));
+                          for (const iframe of iframes) {
+                            try {
+                              const child = iframe.contentDocument;
+                              if (!child) continue;
+                              const result = findInDoc(child, chain.concat([iframe]));
+                              if (result && result.found) return result;
+                            } catch (_err) {}
+                          }
+                          return {found: false};
+                        };
+                        return findInDoc(document, []);
+                        """,
+                        list(selectors),
+                        list(keyword_markers),
+                    ) or {"found": False}
+                except Exception:
+                    return {"found": False}
+
+            def _click_global_rect_via_cdp():
+                rect = _find_subscribe_global_rect() or {}
+                if not rect.get("found"):
+                    return False, "không tìm được rect toàn cục của Subscribe"
+                try:
+                    driver.execute_cdp_cmd(
+                        "Input.dispatchMouseEvent",
+                        {"type": "mouseMoved", "x": rect["cx"], "y": rect["cy"], "button": "left", "buttons": 1},
+                    )
+                    driver.execute_cdp_cmd(
+                        "Input.dispatchMouseEvent",
+                        {"type": "mousePressed", "x": rect["cx"], "y": rect["cy"], "button": "left", "buttons": 1, "clickCount": 1},
+                    )
+                    driver.execute_cdp_cmd(
+                        "Input.dispatchMouseEvent",
+                        {"type": "mouseReleased", "x": rect["cx"], "y": rect["cy"], "button": "left", "buttons": 1, "clickCount": 1},
+                    )
+                    return True, f"global-center=({rect['cx']:.1f}, {rect['cy']:.1f}), depth={rect.get('frameDepth')}, selector={rect.get('selector')}, text={rect.get('text')}"
+                except Exception as e:
+                    return False, str(e)
+
+            def _find_subscribe_button_any_context():
+                try:
+                    driver.switch_to.default_content()
+                except Exception:
+                    pass
+                btn = _find_subscribe_button_in_current_context()
+                if btn:
+                    return btn, None
+                frames = []
+                try:
+                    driver.switch_to.default_content()
+                    frames = [frame for frame in driver.find_elements(By.TAG_NAME, "iframe") if frame.is_displayed()]
+                except Exception:
+                    frames = []
+                for idx, frame in enumerate(frames):
+                    try:
+                        driver.switch_to.default_content()
+                        driver.switch_to.frame(frame)
+                        btn = _find_subscribe_button_in_current_context()
+                        if btn:
+                            return btn, idx
+                    except Exception:
+                        continue
+                try:
+                    driver.switch_to.default_content()
+                except Exception:
+                    pass
+                return None, None
+
+            def _physical_surface_click(button):
+                try:
+                    rect = button.rect or {}
+                except Exception:
+                    rect = {}
+                width = max(float(rect.get("width") or 0), 1.0)
+                height = max(float(rect.get("height") or 0), 1.0)
+                points = (
+                    (width * 0.50, height * 0.50, "center"),
+                    (width * 0.28, height * 0.50, "left-center"),
+                    (width * 0.72, height * 0.50, "right-center"),
+                )
+                last_local_error = None
+                for offset_x, offset_y, label in points:
+                    try:
+                        driver.execute_script("arguments[0].scrollIntoView({block:'center', inline:'center'});", button)
+                    except Exception:
+                        pass
+                    try:
+                        ActionChains(driver).move_to_element_with_offset(
+                            button,
+                            int(offset_x - (width / 2)),
+                            int(offset_y - (height / 2)),
+                        ).pause(0.03).click().perform()
+                        return True, label
+                    except Exception as e:
+                        last_local_error = e
+                    try:
+                        ActionChains(driver).move_to_element_with_offset(
+                            button,
+                            int(offset_x - (width / 2)),
+                            int(offset_y - (height / 2)),
+                        ).pause(0.02).click().pause(0.04).click().perform()
+                        return True, f"{label}-double"
+                    except Exception as e:
+                        last_local_error = e
+                return False, str(last_local_error or "không click được bằng ActionChains offset")
+
+            def _ultimate_scan_click_in_current_context():
+                return driver.execute_async_script(
+                    """
+                    const selectors = arguments[0];
+                    const keywords = arguments[1];
+                    const done = arguments[arguments.length - 1];
+                    const norm = (s) => String(s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                    const isVisible = (el) => {
+                      if (!el) return false;
+                      const r = el.getBoundingClientRect();
+                      return r.width > 0 && r.height > 0 && el.offsetParent !== null;
+                    };
+                    const isEnabled = (el) => {
+                      if (!el) return false;
+                      return !el.disabled
+                        && String(el.getAttribute('disabled') || '').toLowerCase() !== 'true'
+                        && String(el.getAttribute('aria-disabled') || '').toLowerCase() !== 'true';
+                    };
+                    const findCandidate = () => {
+                      const seen = new Set();
+                      const buckets = [];
+                      for (const selector of selectors) {
+                        let nodes = [];
+                        try {
+                          nodes = Array.from(document.querySelectorAll(selector));
+                        } catch (_err) {
+                          continue;
+                        }
+                        for (let node of nodes) {
+                          if (node && node.tagName === 'SPAN') node = node.closest('button');
+                          if (!node || seen.has(node)) continue;
+                          seen.add(node);
+                          const text = norm(node.innerText || node.textContent || node.getAttribute('aria-label') || '');
+                          if (selector === 'button' || selector === 'button span' || selector === 'form button:last-of-type') {
+                            if (!keywords.some((kw) => text.includes(kw))) continue;
+                          }
+                          if (!isVisible(node) || !isEnabled(node)) continue;
+                          buckets.push({node, selector, text});
+                        }
+                      }
+                      return buckets[0] || null;
+                    };
+                    const clickCandidate = (item) => {
+                      const btn = item.node;
+                      btn.scrollIntoView({behavior: 'smooth', block: 'center', inline: 'center'});
+                      const rect = btn.getBoundingClientRect();
+                      const centerX = rect.left + rect.width / 2;
+                      const centerY = rect.top + rect.height / 2;
+                      const opts = {
+                        bubbles: true,
+                        cancelable: true,
+                        view: window,
+                        clientX: centerX,
+                        clientY: centerY,
+                        button: 0,
+                        buttons: 1,
+                      };
+                      for (const type of ['pointerover', 'mouseover', 'pointerenter', 'mouseenter', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                        try { btn.dispatchEvent(new MouseEvent(type, opts)); } catch (_err) {}
+                      }
+                      try { btn.click(); } catch (_err) {}
+                      return {clicked: true, selector: item.selector, text: item.text};
+                    };
+                    let observer = null;
+                    let intervalId = null;
+                    let finished = false;
+                    const finish = (result) => {
+                      if (finished) return;
+                      finished = true;
+                      try { if (observer) observer.disconnect(); } catch (_err) {}
+                      try { if (intervalId) clearInterval(intervalId); } catch (_err) {}
+                      done(result);
+                    };
+                    const tick = () => {
+                      const found = findCandidate();
+                      if (found) {
+                        finish(clickCandidate(found));
+                      }
+                    };
+                    try {
+                      observer = new MutationObserver(() => tick());
+                      observer.observe(document.documentElement || document.body, {subtree: true, childList: true, attributes: true});
+                    } catch (_err) {}
+                    intervalId = setInterval(tick, 180);
+                    tick();
+                    setTimeout(() => finish({clicked: false, selector: '', text: ''}), 1800);
+                    """,
+                    list(selectors),
+                    list(keyword_markers),
+                )
+
+            def _ultimate_scan_click_any_context():
+                try:
+                    driver.switch_to.default_content()
+                except Exception:
+                    pass
+                try:
+                    result = _ultimate_scan_click_in_current_context() or {}
+                    if result.get("clicked"):
+                        return result
+                except Exception as e:
+                    nonlocal_last_error = e
+                    try:
+                        pass
+                    except Exception:
+                        pass
+                frames = []
+                try:
+                    driver.switch_to.default_content()
+                    frames = [frame for frame in driver.find_elements(By.TAG_NAME, "iframe") if frame.is_displayed()]
+                except Exception:
+                    frames = []
+                for idx, frame in enumerate(frames):
+                    try:
+                        driver.switch_to.default_content()
+                        driver.switch_to.frame(frame)
+                        result = _ultimate_scan_click_in_current_context() or {}
+                        if result.get("clicked"):
+                            result["frame_index"] = idx
+                            return result
+                    except Exception:
+                        continue
+                try:
+                    driver.switch_to.default_content()
+                except Exception:
+                    pass
+                return {"clicked": False, "selector": "", "text": ""}
+
+            def _accept_click_attempt(label):
+                accepted, state = _wait_for_submit_effect()
+                if accepted:
+                    print(f"  🔘 {label} -> submit đã ăn: {state.get('reason')}")
+                    time.sleep(0.45)
+                    return True
+                print(f"  ⚠️ {label} nhưng nút chưa đổi trạng thái: {state}")
+                return False
+
+            for retry_idx in range(max_retries):
+                if retry_idx > 0:
+                    ensure_save_address_prompt_closed(timeout=1.2)
+                try:
+                    ActionChains(driver).pause(0.05).send_keys(Keys.ESCAPE).pause(0.05).send_keys(Keys.ESCAPE).perform()
+                except Exception:
+                    pass
+
+                submit_btn, submit_frame_idx = _find_subscribe_button_any_context()
+
+                if not submit_btn:
+                    continue
+
+                try:
+                    driver.execute_script(
+                        """
+                        const el = arguments[0];
+                        el.scrollIntoView({block: 'center', inline: 'center'});
+                        """,
+                        submit_btn,
+                    )
+                    time.sleep(0.12)
+                except Exception as e:
+                    last_error = e
+
+                try:
+                    clicked, detail = _physical_surface_click(submit_btn)
+                    if clicked:
+                        frame_suffix = f", frame={submit_frame_idx}" if submit_frame_idx is not None else ""
+                        if _accept_click_attempt(
+                            f"Physical surface click Subscribe lần {retry_idx + 1}/{max_retries} ({detail}{frame_suffix})"
+                        ):
+                            return
+                except Exception as e:
+                    last_error = e
+
+                if retry_idx == 0:
+                    try:
+                        double_click_auth_button(driver, submit_btn)
+                        if _accept_click_attempt("Double click nhanh Subscribe lần 1/5"):
+                            return
+                    except Exception as e:
+                        last_error = e
+                    ensure_save_address_prompt_closed(timeout=1.6)
+                else:
+                    ensure_save_address_prompt_closed(timeout=1.2)
+
+                try:
+                    clicked, detail = _click_global_rect_via_cdp()
+                    if clicked:
+                        if _accept_click_attempt(
+                            f"Global CDP click Subscribe lần {retry_idx + 1}/{max_retries} ({detail})"
+                        ):
+                            return
+                except Exception as e:
+                    last_error = e
+
+                try:
+                    clicked, detail = _click_center_via_cdp(submit_btn)
+                    if clicked:
+                        if _accept_click_attempt(f"CDP click giữa nút Subscribe lần {retry_idx + 1}/{max_retries}: {detail}"):
+                            return
+                    print(f"  ⚠️ Chưa click giữa nút Subscribe được: {detail}")
+                except Exception as e:
+                    last_error = e
+
+                try:
+                    submitted = driver.execute_script(
+                        """
+                        const btn = arguments[0];
+                        const form = btn.closest('form');
+                        if (form && typeof form.requestSubmit === 'function') {
+                            form.requestSubmit(btn);
+                            return true;
+                        }
+                        return false;
+                        """,
+                        submit_btn,
+                    )
+                    if submitted:
+                        if _accept_click_attempt(f"requestSubmit Subscribe lần {retry_idx + 1}/{max_retries}"):
+                            return
+                except Exception as e:
+                    last_error = e
+
+                try:
+                    clicked = driver.execute_script(
+                        """
+                        const btn = arguments[0];
+                        if (!btn) return false;
+                        const rect = btn.getBoundingClientRect();
+                        const centerX = rect.left + rect.width / 2;
+                        const centerY = rect.top + rect.height / 2;
+                        const opts = {
+                          bubbles: true,
+                          cancelable: true,
+                          view: window,
+                          clientX: centerX,
+                          clientY: centerY,
+                          button: 0,
+                          buttons: 1,
+                        };
+                        for (const type of ['pointerover', 'mouseover', 'pointerenter', 'mouseenter', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                          btn.dispatchEvent(new MouseEvent(type, opts));
+                        }
+                        return true;
+                        """,
+                        submit_btn,
+                    )
+                    if clicked:
+                        if _accept_click_attempt(f"JS event click Subscribe lần {retry_idx + 1}/{max_retries}"):
+                            return
+                except Exception as e:
+                    last_error = e
+
+                try:
+                    submit_btn.send_keys(Keys.ENTER)
+                    if _accept_click_attempt(f"Enter Subscribe lần {retry_idx + 1}/{max_retries}"):
+                        return
+                except Exception as e:
+                    last_error = e
+
+                try:
+                    driver.execute_script("arguments[0].focus();", submit_btn)
+                    submit_btn.send_keys(Keys.SPACE)
+                    if _accept_click_attempt(f"Space Subscribe lần {retry_idx + 1}/{max_retries}"):
+                        return
+                except Exception as e:
+                    last_error = e
+
+                try:
+                    ActionChains(driver).move_to_element(submit_btn).pause(0.04).click_and_hold(submit_btn).pause(0.18).release(submit_btn).perform()
+                    try:
+                        ActionChains(driver).pause(0.08).send_keys(Keys.ESCAPE).perform()
+                    except Exception:
+                        pass
+                    if _accept_click_attempt(f"Click-giu Subscribe lần {retry_idx + 1}/{max_retries}"):
+                        return
+                except Exception as e:
+                    last_error = e
+
+                try:
+                    driver.execute_script("arguments[0].click();", submit_btn)
+                    try:
+                        ActionChains(driver).pause(0.08).send_keys(Keys.ESCAPE).perform()
+                    except Exception:
+                        pass
+                    if _accept_click_attempt(f"JS click Subscribe lần {retry_idx + 1}/{max_retries}"):
+                        return
+                except Exception as e:
+                    last_error = e
+
+                time.sleep(0.3)
+
+            raise last_error or RuntimeError(f"Không click được nút Subscribe sau {max_retries} lần thử")
+
         def loop_submit_and_fix():
             max_attempts = 5
             for attempt in range(max_attempts):
@@ -6201,11 +9263,10 @@ def subscribe_plus_trial(driver):
                 # 1. Click gửi
                 driver.switch_to.default_content() # Nút thường nằm trong document chính
                 try:
-                    submit_btn = WebDriverWait(driver, 5).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button[type='submit'], button[class*='Subscribe']")))
-                    driver.execute_script("arguments[0].click();", submit_btn)
-                    print("  🔘 Đã click nút gửi")
-                except:
-                    print("  ⚠️ Không tìm thấy nút gửi")
+                    click_subscribe_button()
+                    print("  🔘 Đã click nút Subscribe")
+                except Exception as e:
+                    print(f"  ⚠️ Không click được nút gửi: {str(e).splitlines()[0]}")
                 
                 time.sleep(3) # Chờ kết quả kiểm tra
                 
@@ -6261,8 +9322,7 @@ def subscribe_plus_trial(driver):
                              for el in line1_inputs:
                                  if el.is_displayed() and not el.get_attribute('value'):
                                       print(f"    -> Điền bổ sung Address Line 1 ({billing_info['address1']})")
-                                      el.clear()
-                                      type_slowly(el, billing_info['address1'])
+                                      fill_text_fast(driver, el, billing_info['address1'])
                                       # Đôi khi điền xong cần nhấn Enter
                                       try: el.send_keys(Keys.ENTER)
                                       except: pass
@@ -6274,12 +9334,12 @@ def subscribe_plus_trial(driver):
                         for el in state_inputs:
                             try:
                                 if el.is_displayed():
-                                    print("    -> Điền bổ sung State (US mặc định New York)")
+                                    print(f"    -> Điền bổ sung State ({billing_info['state']})")
                                     if el.tag_name == 'select':
-                                        el.send_keys("New York")
+                                        el.send_keys(billing_info["state"])
                                         el.send_keys(Keys.ENTER)
                                     else:
-                                        el.send_keys("New York")
+                                        fill_text_fast(driver, el, billing_info["state"])
                                         el.send_keys(Keys.ARROW_DOWN)
                                         el.send_keys(Keys.ENTER)
                             except: pass
@@ -6289,9 +9349,8 @@ def subscribe_plus_trial(driver):
                         for el in zip_inputs:
                             try:
                                 if el.is_displayed() and not el.get_attribute('value'):
-                                    print("    -> Điền bổ sung Zip (10001)")
-                                    el.clear()
-                                    type_slowly(el, "10001")
+                                    print(f"    -> Điền bổ sung Zip ({billing_info['zip']})")
+                                    fill_text_fast(driver, el, billing_info["zip"])
                             except: pass
                             
                         # Kiểm tra thành phố
@@ -6299,9 +9358,8 @@ def subscribe_plus_trial(driver):
                         for el in city_inputs:
                             try:
                                 if el.is_displayed() and not el.get_attribute('value'):
-                                    print("    -> Điền bổ sung City (New York)")
-                                    el.clear()
-                                    type_slowly(el, "New York")
+                                    print(f"    -> Điền bổ sung City ({billing_info['city']})")
+                                    fill_text_fast(driver, el, billing_info["city"])
                             except: pass
                             
                     driver.switch_to.default_content()

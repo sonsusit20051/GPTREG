@@ -430,43 +430,53 @@ def generate_japan_address():
 def generate_us_address():
     """
     Tạo địa chỉ Mỹ ngẫu nhiên.
-    Dùng Faker để tạo địa chỉ Mỹ theo phong cách thực tế.
+    Dùng các cụm city/state/zip đã khớp sẵn để tránh lỗi xác định thuế.
     """
+    us_localities = [
+        {"state": "Delaware", "city": "Wilmington", "zip": "19801"},
+        {"state": "Delaware", "city": "Dover", "zip": "19901"},
+        {"state": "Delaware", "city": "Newark", "zip": "19702"},
+        {"state": "Oregon", "city": "Portland", "zip": "97205"},
+        {"state": "Oregon", "city": "Salem", "zip": "97301"},
+        {"state": "Oregon", "city": "Eugene", "zip": "97401"},
+        {"state": "Montana", "city": "Billings", "zip": "59101"},
+        {"state": "Montana", "city": "Missoula", "zip": "59801"},
+        {"state": "Montana", "city": "Helena", "zip": "59601"},
+        {"state": "New Hampshire", "city": "Manchester", "zip": "03101"},
+        {"state": "New Hampshire", "city": "Nashua", "zip": "03060"},
+        {"state": "New Hampshire", "city": "Concord", "zip": "03301"},
+    ]
+
+    locality = random.choice(us_localities)
+    street_number = random.randint(100, 9999)
+    street_names = [
+        "Main St",
+        "Oak Ave",
+        "Maple Dr",
+        "Cedar Ln",
+        "Park Blvd",
+        "Washington St",
+        "Lincoln Ave",
+        "Jefferson Dr",
+        "Madison Ln",
+    ]
+    street = random.choice(street_names)
+
     if FAKER_AVAILABLE:
-        # Dùng Faker Mỹ
         fake_us = Faker('en_US')
-        
-        # Các bang thường miễn thuế hoặc thuế thấp, thân thiện hơn cho thanh toán
-        states = [
-            {"name": "Delaware", "code": "DE", "cities": ["Wilmington", "Dover", "Newark"]},
-            {"name": "Oregon", "code": "OR", "cities": ["Portland", "Salem", "Eugene"]},
-            {"name": "Montana", "code": "MT", "cities": ["Billings", "Missoula", "Helena"]},
-            {"name": "New Hampshire", "code": "NH", "cities": ["Manchester", "Nashua", "Concord"]},
-        ]
-        
-        state_info = random.choice(states)
-        city = random.choice(state_info["cities"])
-        
-        # Tạo địa chỉ đường phố
-        street_number = random.randint(100, 9999)
-        street_names = ["Main St", "Oak Ave", "Maple Dr", "Cedar Ln", "Park Blvd", 
-                       "Washington St", "Lincoln Ave", "Jefferson Dr", "Madison Ln"]
-        street = random.choice(street_names)
-        
-        addr = {
-            "zip": fake_us.zipcode_in_state(state_info["code"]) if hasattr(fake_us, 'zipcode_in_state') else f"{random.randint(10000, 99999)}",
-            "state": state_info["name"],
-            "city": city,
-            "address1": f"{street_number} {street}"
-        }
+        street_suffix = fake_us.secondary_address() if random.random() < 0.18 else ""
+        address1 = f"{street_number} {street}"
+        if street_suffix:
+            address1 = f"{address1} {street_suffix}"
     else:
-        # Quay về địa chỉ cố định
-        addr = {
-            "zip": "10001",
-            "state": "New York",
-            "city": "New York",
-            "address1": f"{random.randint(100, 999)} Main St"
-        }
+        address1 = f"{street_number} {street}"
+
+    addr = {
+        "zip": locality["zip"],
+        "state": locality["state"],
+        "city": locality["city"],
+        "address1": address1,
+    }
     
     print(f"✅ Đã tạo địa chỉ Mỹ: {addr['city']}, {addr['state']} {addr['zip']}")
     return addr

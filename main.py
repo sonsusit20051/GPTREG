@@ -37,6 +37,7 @@ from browser import (
     BrowserStartupError,
     click_resend_email_button,
     create_driver,
+    dismiss_chatgpt_obstacles_until_clear,
     dismiss_chatgpt_onboarding_if_present,
     fill_signup_form,
     enter_verification_code,
@@ -44,8 +45,15 @@ from browser import (
     get_registered_profile_name,
     setup_two_factor_auth,
 )
-from checkout_new import create_trial_checkout
-from checkout_new import create_trial_checkout_from_auth_context, extract_checkout_auth_context
+from bizmailer_checkout import (
+    create_trial_checkout_from_bizmailer_context,
+    extract_bizmailer_context,
+)
+from checkout_new import (
+    create_trial_checkout,
+    create_trial_checkout_from_auth_context,
+    extract_checkout_auth_context,
+)
 
 
 MAX_PROFILE_RESTARTS = 3
@@ -53,16 +61,18 @@ CHECKOUT_HOME_STABILIZE_SECONDS = 5
 OTP_WAIT_BEFORE_RESEND_SECONDS = 10
 OTP_RESEND_CLICK_TIMES = 2
 SETUP_2FA_ENABLED = True
+MAX_2FA_SETUP_ATTEMPTS = 4
 DEFAULT_ACCOUNT_PASSWORD = "Chatgpt123456@"
 KEEP_PROFILE_OPEN_FOR_DEBUG = str(os.environ.get("KEEP_PROFILE_OPEN_FOR_DEBUG", "1")).strip().lower() in ("1", "true", "yes", "on")
 PROFILE_RESTART_REASON_MARKERS = (
     "Điền form đăng ký thất bại",
-    "Không lấy được OTP hợp lệ",
     "Form inline lỗi",
     "Trang lỗi sau OTP",
     "Profile lỗi lặp quá",
     "Điền thông tin cá nhân thất bại",
     "Nhập mã xác minh thất bại",
+    "2FA chưa bật thành công",
+    "Bật 2FA thất bại",
     "Lỗi:",
 )
 
@@ -100,6 +110,117 @@ def _save_twofa_result(email_bundle: str, secret: str, backup_codes: list[str] |
         print(f"⚠️ Lưu secret 2FA thất bại: {e}")
 
 
+def _apply_twofa_result(
+    email_bundle: str,
+    twofa_result: dict[str, Any] | None,
+) -> tuple[str, bool]:
+    result_bundle = str((twofa_result or {}).get("account_bundle") or "").strip()
+    if result_bundle and email_bundle and result_bundle != email_bundle:
+        print("⚠️ Bỏ qua secret 2FA vì không khớp account bundle hiện tại")
+        return "", False
+    secret = str((twofa_result or {}).get("secret") or "").strip()
+    backup_codes = list((twofa_result or {}).get("backup_codes") or [])
+    verified = bool((twofa_result or {}).get("verified", False))
+    already_enabled = bool((twofa_result or {}).get("already_enabled", False))
+
+    if secret:
+        _save_twofa_result(email_bundle, secret, backup_codes)
+
+    if verified or already_enabled:
+        print("✅ Đã hoàn tất setup 2FA")
+    elif secret:
+        print("🧪 Đã lấy được secret 2FA và dừng ở bước manual secret để debug")
+    elif twofa_result and not twofa_result.get("success"):
+        print(f"⚠️ Setup 2FA thất bại: {twofa_result.get('reason')}")
+
+    if not (verified or already_enabled):
+        return "", False
+
+    return secret, True
+
+
+def _setup_twofa_with_retries(
+    driver,
+    password: str,
+    *,
+    max_attempts: int = MAX_2FA_SETUP_ATTEMPTS,
+    log_func=print,
+) -> dict[str, Any]:
+    last_result: dict[str, Any] = {"success": False, "reason": "Chưa chạy setup 2FA"}
+    attempts = max(1, int(max_attempts))
+
+    for attempt in range(1, attempts + 1):
+        if attempt > 1:
+            log_func(f"🔁 Retry setup 2FA lần {attempt}/{attempts}...")
+            dismiss_chatgpt_obstacles_until_clear(
+                driver,
+                max_passes=3,
+                rounds_per_pass=6,
+                settle_seconds=0.8,
+                log_func=log_func,
+            )
+            time.sleep(1)
+
+        last_result = setup_two_factor_auth(driver, password, log_func=log_func) or {
+            "success": False,
+            "reason": "setup_two_factor_auth không trả kết quả",
+        }
+        if last_result.get("success") and (
+            bool(last_result.get("verified"))
+            or bool(last_result.get("already_enabled"))
+        ):
+            return last_result
+
+        reason = str(last_result.get("reason") or "Không rõ lỗi").strip()
+        log_func(f"⚠️ Setup 2FA chưa thành công ở lần {attempt}/{attempts}: {reason}")
+
+    return {
+        "success": False,
+        "reason": f"Bật 2FA thất bại sau {attempts} lần: {last_result.get('reason') or 'Không rõ lỗi'}",
+    }
+
+
+def _create_checkout_with_priority(
+    driver,
+    *,
+    biz_context: dict[str, Any] | None = None,
+    checkout_auth_context: dict[str, Any] | None = None,
+    log_func=print,
+) -> dict[str, Any]:
+    biz_context = biz_context or {}
+    checkout_auth_context = checkout_auth_context or {}
+
+    if biz_context.get("raw_data") or biz_context.get("stripe_url"):
+        log_func("🌐 Ưu tiên gọi Bizmailer trước...")
+        biz_result = create_trial_checkout_from_bizmailer_context(
+            biz_context,
+            log_func=log_func,
+        )
+        if biz_result.get("success"):
+            return biz_result
+        log_func(f"⚠️ Bizmailer thất bại, chuyển sang checkout_new: {biz_result.get('failure_reason')}")
+
+    if checkout_auth_context.get("token"):
+        log_func("🌐 Đang fallback sang checkout_new từ auth context...")
+        checkout_result = create_trial_checkout_from_auth_context(
+            checkout_auth_context,
+            country_code="ID",
+            currency="IDR",
+            log_func=log_func,
+        )
+        if checkout_result.get("success"):
+            return checkout_result
+        log_func(f"⚠️ checkout_new từ auth context thất bại: {checkout_result.get('failure_reason')}")
+
+    log_func("🌐 Fallback cuối: gọi checkout_new trực tiếp từ browser...")
+    return create_trial_checkout(
+        driver,
+        country_code="ID",
+        currency="IDR",
+        log_func=log_func,
+    )
+
+
 def should_restart_with_new_profile(result: dict[str, Any] | None) -> bool:
     """Xác định lỗi có nên bỏ profile hiện tại và chạy lại từ đầu với profile mới hay không."""
     if not isinstance(result, dict):
@@ -119,6 +240,7 @@ def register_one_account_with_profile_retries(
     return_details: bool = False,
     mark_result: bool = True,
     max_profile_restarts: int = MAX_PROFILE_RESTARTS,
+    gopay_otp_callback=None,
 ):
     """Chạy lại toàn bộ account với profile mới nếu profile hiện tại bị kẹt/quá ngưỡng retry."""
     attempts = max(1, int(max_profile_restarts) + 1)
@@ -137,6 +259,7 @@ def register_one_account_with_profile_retries(
             account_password_override=account_password_override,
             return_details=return_details,
             mark_result=mark_result if attempt == attempts else False,
+            gopay_otp_callback=gopay_otp_callback,
         )
         last_result = result
 
@@ -171,6 +294,7 @@ def register_one_account(
     account_password_override: str = None,
     return_details: bool = False,
     mark_result: bool = True,
+    gopay_otp_callback=None,
 ):
     """
     Đăng ký một tài khoản.
@@ -192,6 +316,7 @@ def register_one_account(
     no_trial = False
     manual_checkout_ready = False
     twofa_secret = ""
+    twofa_completed_success = False
     timings = {}
     stage_started_at = time.perf_counter()
 
@@ -411,22 +536,32 @@ def register_one_account(
         print(f"⏳ Đã vào trang chủ ChatGPT, chờ ổn định {CHECKOUT_HOME_STABILIZE_SECONDS}s trước khi chạy checkout mới...")
         time.sleep(CHECKOUT_HOME_STABILIZE_SECONDS)
         dismiss_chatgpt_onboarding_if_present(driver, max_rounds=10)
+        print("🧹 Dọn sạch onboarding/chướng ngại vật trước khi lấy auth session checkout_new...")
+        dismiss_chatgpt_obstacles_until_clear(
+            driver,
+            max_passes=6,
+            rounds_per_pass=8,
+            settle_seconds=1.0,
+            log_func=print,
+        )
+        time.sleep(0.5)
 
         checkout_result_box = {"result": None}
         checkout_thread = None
         checkout_started_parallel = False
 
-        print("🔗 Đang chuẩn bị auth context để thử chạy song song checkout new + bật 2FA...")
+        print("🔗 Đang chuẩn bị context để chạy song song checkout + bật 2FA...")
+        biz_context = extract_bizmailer_context(driver, log_func=print)
         auth_context = extract_checkout_auth_context(driver, log_func=print)
-        if auth_context.get("token"):
+        if (biz_context.get("raw_data") or biz_context.get("stripe_url")) or auth_context.get("token"):
             def _parallel_checkout_worker():
                 started = time.perf_counter()
-                print("🔗 Luồng nền checkout mới đã bắt đầu...")
+                print("🔗 Luồng nền checkout ưu tiên Bizmailer đã bắt đầu...")
                 try:
-                    checkout_result_box["result"] = create_trial_checkout_from_auth_context(
-                        auth_context,
-                        country_code="ID",
-                        currency="IDR",
+                    checkout_result_box["result"] = _create_checkout_with_priority(
+                        driver,
+                        biz_context=biz_context,
+                        checkout_auth_context=auth_context,
                         log_func=print,
                     )
                 except Exception as e:
@@ -443,16 +578,22 @@ def register_one_account(
             checkout_thread.start()
             checkout_started_parallel = True
         else:
-            print("⚠️ Không lấy được auth context để chạy checkout song song, fallback tuần tự như cũ")
+            print("⚠️ Không lấy được context checkout, fallback tuần tự")
 
         twofa_result = {"success": False, "reason": "Đã tắt setup 2FA"}
         if SETUP_2FA_ENABLED:
-            print("🧹 Checkout xong, dọn sạch onboarding/chướng ngại vật trước khi bật 2FA...")
-            dismiss_chatgpt_onboarding_if_present(driver, max_rounds=10)
+            print("🧹 Re-check nhanh chướng ngại vật trước khi bật 2FA...")
+            dismiss_chatgpt_obstacles_until_clear(
+                driver,
+                max_passes=5,
+                rounds_per_pass=8,
+                settle_seconds=1.0,
+                log_func=print,
+            )
             time.sleep(0.5)
             print("🔐 Bắt đầu setup 2FA trong khi checkout đang xử lý nền...")
             with _timed_stage("setup_2fa"):
-                twofa_result = setup_two_factor_auth(driver, password, log_func=print)
+                twofa_result = _setup_twofa_with_retries(driver, password, log_func=print)
 
         if checkout_started_parallel and checkout_thread:
             checkout_thread.join(timeout=45)
@@ -461,17 +602,23 @@ def register_one_account(
                 "failure_reason": "Checkout song song không trả kết quả đúng hạn",
             }
         else:
-            print("🔗 Đã vào trang chủ ChatGPT, bắt đầu tạo checkout trial mới...")
+            print("🔗 Đã vào trang chủ ChatGPT, bắt đầu tạo checkout trial theo thứ tự Bizmailer -> checkout_new...")
             with _timed_stage("get_pay_link"):
-                checkout_result = create_trial_checkout(
+                checkout_result = _create_checkout_with_priority(
                     driver,
-                    country_code="ID",
-                    currency="IDR",
+                    biz_context=biz_context if 'biz_context' in locals() else None,
+                    checkout_auth_context=auth_context if 'auth_context' in locals() else None,
                     log_func=print,
                 )
         _report("checkout_link")
 
         email_bundle = _email_context_bundle(email_context)
+        if SETUP_2FA_ENABLED:
+            if isinstance(twofa_result, dict):
+                twofa_result["account_bundle"] = email_bundle
+            twofa_secret, twofa_completed_success = _apply_twofa_result(email_bundle, twofa_result)
+            _report("setup_2fa")
+
         if checkout_result.get("success"):
             checkout_url = str(checkout_result.get("checkout_url") or "").strip()
             trial_success = bool(checkout_url)
@@ -481,36 +628,39 @@ def register_one_account(
             trial_success = False
             failure_reason = str(checkout_result.get("failure_reason") or "Tạo checkout trial thất bại")
 
-        if checkout_url:
+        success = bool(checkout_url and twofa_completed_success)
+
+        if checkout_url and twofa_completed_success:
             update_account_status(
                 email,
                 f"Trial checkout: {checkout_url}",
                 metadata=email_bundle,
             )
             save_success_account(email_bundle, checkout_url)
+            manual_checkout_ready = True
+            try:
+                print("🌐 Đang mở link Midtrans trên profile hiện tại...")
+                driver.get(checkout_url)
+                print("🧪 Đã mở checkout trên profile hiện tại, giữ nguyên browser/profile để xử lý tiếp")
+            except Exception as e:
+                print(f"⚠️ Mở link checkout trên profile hiện tại thất bại: {e}")
             print("✅ Đã hoàn tất luồng checkout mới")
             print("✅ Output checkout trial:")
             print(checkout_url)
-
-            if SETUP_2FA_ENABLED:
-                if twofa_result.get("success"):
-                    secret = str(twofa_result.get("secret") or "").strip()
-                    backup_codes = list(twofa_result.get("backup_codes") or [])
-                    verified = bool(twofa_result.get("verified", True))
-                    if secret:
-                        twofa_secret = secret
-                        _save_twofa_result(email_bundle, secret, backup_codes)
-                    if verified:
-                        print("✅ Đã hoàn tất setup 2FA sau checkout")
-                    else:
-                        print("🧪 Đã lấy được secret 2FA và dừng ở bước manual secret để debug")
-                else:
-                    print(f"⚠️ Setup 2FA thất bại nhưng vẫn giữ kết quả checkout: {twofa_result.get('reason')}")
-                _report("setup_2fa")
         else:
+            if checkout_url and not twofa_completed_success:
+                status_text = "Đã tạo checkout nhưng 2FA chưa bật thành công"
+                twofa_reason = str(twofa_result.get("reason") or "Không rõ lỗi 2FA").strip()
+                failure_reason = f"2FA chưa bật thành công: {twofa_reason}"
+            elif twofa_completed_success:
+                status_text = f"Đã bật 2FA nhưng tạo checkout trial thất bại: {failure_reason}"
+            elif twofa_secret:
+                status_text = f"Đã lấy secret 2FA nhưng tạo checkout trial thất bại: {failure_reason}"
+            else:
+                status_text = f"Đăng ký xong nhưng tạo checkout trial thất bại: {failure_reason}"
             update_account_status(
                 email,
-                f"Đăng ký xong nhưng tạo checkout trial thất bại: {failure_reason}",
+                status_text,
                 metadata=email_bundle,
             )
             print(f"❌ Không tạo được checkout trial mới: {failure_reason}")
