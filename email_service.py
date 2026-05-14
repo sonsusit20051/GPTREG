@@ -470,7 +470,7 @@ class EmailService:
             str(source.get(key, "") or data.get(key, ""))
             for key in ("subject", "message", "content", "body", "from", "sender")
         )
-        code = self._extract_openai_code(text_blob)
+        code = self._extract_known_service_code(text_blob)
         if not code and self.api_type != "all":
             code = extract_verification_code(self._html_to_text(text_blob))
 
@@ -621,6 +621,7 @@ class EmailService:
             if not any(keyword in lowered for keyword in (
                 "openai",
                 "chatgpt",
+                "canva",
                 "verification",
                 "verify",
                 "code",
@@ -628,11 +629,15 @@ class EmailService:
                 "ma xac minh",
                 "tạm thời",
                 "tam thoi",
+                "hoàn tất việc đăng ký",
+                "hoan tat viec dang ky",
+                "đăng ký",
+                "dang ky",
             )):
                 skipped_no_keyword += 1
                 continue
 
-            code = self._extract_openai_code(text_blob)
+            code = self._extract_known_service_code(text_blob)
             if code:
                 if exclude_codes and code in exclude_codes:
                     continue
@@ -692,6 +697,12 @@ class EmailService:
                             return nested.strip()
         return ""
 
+    def _extract_known_service_code(self, content: str) -> Optional[str]:
+        code = self._extract_openai_code(content)
+        if code:
+            return code
+        return self._extract_canva_code(content)
+
     def _extract_openai_code(self, content: str) -> Optional[str]:
         """Chỉ extract OTP từ nội dung OpenAI/ChatGPT hợp lệ."""
         if not content:
@@ -715,6 +726,34 @@ class EmailService:
             r"ma\s+xac\s+minh\s+tam\s+thoi\s+nay\s+de\s+tiep\s+tuc[:\s]+(\d{6})",
             r"mã\s+xác\s+minh\s+tạm\s+thời.*?(\d{6})",
             r"ma\s+xac\s+minh\s+tam\s+thoi.*?(\d{6})",
+        ]
+        for pattern in phrase_patterns:
+            match = re.search(pattern, content, re.IGNORECASE)
+            if match:
+                return match.group(1)
+
+        return extract_verification_code(content)
+
+    def _extract_canva_code(self, content: str) -> Optional[str]:
+        """Chỉ extract OTP từ nội dung Canva hợp lệ."""
+        if not content:
+            return None
+
+        content = self._html_to_text(content)
+        lowered = content.lower()
+        if (
+            "canva" not in lowered
+            and "hoàn tất việc đăng ký" not in lowered
+            and "hoan tat viec dang ky" not in lowered
+        ):
+            return None
+
+        phrase_patterns = [
+            r"nhập\s+mã\s+này\s+trong\s+vòng\s+\d+\s+phút.*?(\d{6})",
+            r"nhap\s+ma\s+nay\s+trong\s+vong\s+\d+\s+phut.*?(\d{6})",
+            r"hoàn\s+tất\s+việc\s+đăng\s+ký.*?(\d{6})",
+            r"hoan\s+tat\s+viec\s+dang\s+ky.*?(\d{6})",
+            r"canva.*?(\d{6})",
         ]
         for pattern in phrase_patterns:
             match = re.search(pattern, content, re.IGNORECASE)

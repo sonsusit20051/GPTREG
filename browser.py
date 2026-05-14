@@ -170,6 +170,52 @@ def get_chrome_major_version():
     return None
 
 
+def _extract_major_version_from_text(text: str) -> int | None:
+    match = re.search(r"(\d+)\.", str(text or "").strip())
+    if match:
+        try:
+            return int(match.group(1))
+        except Exception:
+            return None
+    return None
+
+
+def _get_binary_major_version(binary_path: str) -> int | None:
+    if not binary_path or not os.path.exists(binary_path):
+        return None
+    try:
+        output = subprocess.check_output([binary_path, "--version"], stderr=subprocess.STDOUT, text=True).strip()
+    except Exception:
+        return None
+    return _extract_major_version_from_text(output)
+
+
+def _get_chromedriver_major_version(driver_path: str) -> int | None:
+    if not driver_path or not os.path.exists(driver_path):
+        return None
+    try:
+        output = subprocess.check_output([driver_path, "--version"], stderr=subprocess.STDOUT, text=True).strip()
+    except Exception:
+        return None
+    return _extract_major_version_from_text(output)
+
+
+def _get_debugger_browser_major_version(debugger_address: str) -> int | None:
+    address = str(debugger_address or "").strip()
+    if not address:
+        return None
+    try:
+        response = http_session.get(f"http://{address}/json/version", timeout=5)
+        response.raise_for_status()
+        data = response.json() if response.content else {}
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    browser_text = str(data.get("Browser") or data.get("browser") or "").strip()
+    return _extract_major_version_from_text(browser_text)
+
+
 def _install_mouse_event_screen_patch(driver):
     """Giả lập screenX/screenY ổn định hơn cho MouseEvent/PointerEvent."""
     source = """
@@ -214,10 +260,16 @@ def _pick_gpm_profile_id():
     global _gpm_profile_index
 
     profile_ids = [str(profile_id).strip() for profile_id in GPM_PROFILE_IDS if str(profile_id).strip()]
-    if not profile_ids and GPM_AUTO_CREATE:
-        return _create_gpm_profile()
-    if not profile_ids:
-        profile_ids = _load_gpm_profile_ids()
+    if profile_ids:
+        with _gpm_profile_lock:
+            profile_id = profile_ids[_gpm_profile_index % len(profile_ids)]
+            _gpm_profile_index += 1
+            return profile_id, False
+
+    if GPM_AUTO_CREATE:
+        return _create_gpm_profile(), True
+
+    profile_ids = _load_gpm_profile_ids()
     if not profile_ids:
         raise RuntimeError(
             "browser.gpm_enabled=true nhưng không tìm thấy profile GPM nào. "
@@ -227,7 +279,7 @@ def _pick_gpm_profile_id():
     with _gpm_profile_lock:
         profile_id = profile_ids[_gpm_profile_index % len(profile_ids)]
         _gpm_profile_index += 1
-        return profile_id
+        return profile_id, False
 
 
 def _create_gpm_profile():
@@ -288,14 +340,24 @@ def _create_gpm_profile():
 
 def _load_gpm_profile_ids():
     profiles = _fetch_gpm_profiles()
-    profile_ids = [
-        str(profile.get("id", "")).strip()
-        for profile in profiles
-        if isinstance(profile, dict) and str(profile.get("id", "")).strip()
-    ]
+    manual_profile_ids = []
+    auto_profile_ids = []
+    for profile in profiles:
+        if not isinstance(profile, dict):
+            continue
+        profile_id = str(profile.get("id", "")).strip()
+        if not profile_id:
+            continue
+        profile_name = str(profile.get("name", "")).strip()
+        if profile_name.startswith(GPM_AUTO_PROFILE_PREFIX):
+            auto_profile_ids.append(profile_id)
+        else:
+            manual_profile_ids.append(profile_id)
+    profile_ids = manual_profile_ids or auto_profile_ids
 
     if profile_ids:
-        print(f"✅ Đã lấy {len(profile_ids)} profile từ GPM Login")
+        source = "thủ công" if manual_profile_ids else "auto"
+        print(f"✅ Đã lấy {len(profile_ids)} profile {source} từ GPM Login")
     return profile_ids
 
 
@@ -626,7 +688,7 @@ def _set_browser_window_rect(driver, rect, label="profile"):
 
 def create_gpm_driver():
     started_at = time.perf_counter()
-    profile_id = _pick_gpm_profile_id()
+    profile_id, auto_created = _pick_gpm_profile_id()
     api_url = GPM_API_URL.rstrip("/")
     endpoint = GPM_START_ENDPOINT.format(profile_id=profile_id).lstrip("/")
     start_url = f"{api_url}/{endpoint}"
@@ -688,43 +750,91 @@ def create_gpm_driver():
     data = response.json()
 
     if isinstance(data, dict) and data.get("success") is False:
-        if GPM_AUTO_CREATE:
+        message = str(data.get("message") or "").strip()
+        if auto_created:
             _delete_gpm_profile(profile_id, reason="start thất bại")
+        if message == "ProfileInUse":
+            raise BrowserStartupError(
+                f"GPM profile đang được dùng ở nơi khác: {profile_id}. "
+                "Hãy đóng profile này trong GPM rồi chạy lại."
+            )
         raise BrowserStartupError(f"GPM start profile thất bại: {data}")
 
-    _register_active_gpm_profile(profile_id, auto_created=GPM_AUTO_CREATE)
+    _register_active_gpm_profile(profile_id, auto_created=auto_created)
 
     debugger_address, driver_path = _extract_gpm_driver_info(data)
     if not debugger_address:
-        _cleanup_gpm_profile(profile_id, reason="không có debugger address", stop_first=True, delete_created=GPM_AUTO_CREATE)
+        _cleanup_gpm_profile(profile_id, reason="không có debugger address", stop_first=True, delete_created=auto_created)
         raise BrowserStartupError(f"GPM không trả remote_debugging_port/remote_debugging_address: {data}")
 
     options = webdriver.ChromeOptions()
     options.add_experimental_option("debuggerAddress", debugger_address)
     browser_binary = _find_gpm_browser_binary()
+    target_browser_major = None
     if browser_binary:
         options.binary_location = browser_binary
         print(f"🧭 Dùng GPM browser binary: {browser_binary}")
+        target_browser_major = _get_binary_major_version(browser_binary)
+        if target_browser_major:
+            print(f"🧭 GPM browser major version: {target_browser_major}")
+    actual_browser_major = _get_debugger_browser_major_version(debugger_address)
+    if actual_browser_major:
+        print(f"🧭 Browser thật từ remote debugging port: {actual_browser_major}")
+        if target_browser_major and actual_browser_major != target_browser_major:
+            print(
+                f"⚠️ Browser thật lệch với binary dự kiến: "
+                f"binary={target_browser_major}, remote={actual_browser_major}"
+            )
+        target_browser_major = actual_browser_major
 
     print(f"🔌 Attach Selenium vào GPM browser: {debugger_address}")
-    if driver_path and os.path.exists(driver_path) and os.access(driver_path, os.X_OK):
-        print(f"🧭 Dùng GPM driver_path: {driver_path}")
-        service = ChromeService(executable_path=driver_path)
-    else:
-        if driver_path:
+    service = None
+    usable_gpm_driver = False
+    if driver_path and os.path.exists(driver_path):
+        if not os.access(driver_path, os.X_OK):
+            try:
+                os.chmod(driver_path, 0o755)
+            except Exception:
+                pass
+        if os.access(driver_path, os.X_OK):
+            gpm_driver_major = _get_chromedriver_major_version(driver_path)
+            if not target_browser_major or not gpm_driver_major or gpm_driver_major == target_browser_major:
+                print(f"🧭 Dùng GPM driver_path: {driver_path}")
+                service = ChromeService(executable_path=driver_path)
+                usable_gpm_driver = True
+            else:
+                print(
+                    f"⚠️ Bỏ qua GPM driver_path do lệch major version: "
+                    f"driver={gpm_driver_major}, browser={target_browser_major}"
+                )
+    if not usable_gpm_driver:
+        if driver_path and not os.path.exists(driver_path):
+            print(f"⚠️ GPM trả driver_path nhưng file không tồn tại: {driver_path}")
+        elif driver_path and not os.access(driver_path, os.X_OK):
             print(f"⚠️ GPM trả driver_path nhưng không dùng được: {driver_path}")
+
         local_driver = _find_local_chromedriver()
-        if local_driver:
-            print(f"🧭 GPM không trả driver_path, dùng local ChromeDriver: {local_driver}")
+        local_driver_major = _get_chromedriver_major_version(local_driver) if local_driver else None
+        if local_driver and (
+            not target_browser_major
+            or not local_driver_major
+            or local_driver_major == target_browser_major
+        ):
+            print(f"🧭 Dùng local ChromeDriver: {local_driver}")
             service = ChromeService(executable_path=local_driver)
         else:
-            print("⚠️ GPM không trả driver_path, Selenium sẽ tự tìm ChromeDriver trong PATH")
+            if local_driver and local_driver_major and target_browser_major and local_driver_major != target_browser_major:
+                print(
+                    f"⚠️ Bỏ qua local ChromeDriver do lệch major version: "
+                    f"driver={local_driver_major}, browser={target_browser_major}"
+                )
+            print("🧭 Dùng Selenium Manager để tự tìm/tải ChromeDriver phù hợp")
             service = ChromeService()
 
     try:
         driver = webdriver.Chrome(service=service, options=options)
     except Exception as e:
-        _cleanup_gpm_profile(profile_id, reason="attach Selenium thất bại", stop_first=True, delete_created=GPM_AUTO_CREATE)
+        _cleanup_gpm_profile(profile_id, reason="attach Selenium thất bại", stop_first=True, delete_created=auto_created)
         raise BrowserStartupError(f"Attach Selenium vào GPM browser thất bại: {e}") from e
 
     _attach_gpm_close_hook(driver, profile_id)

@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any
-from urllib.parse import quote, unquote, urlsplit
+from urllib.parse import quote, unquote, urljoin, urlsplit
 
 import requests
 
@@ -69,6 +69,7 @@ _pending_gopay_otp: dict[int, dict[str, Any]] = {}
 _pending_get_session_chunks: dict[int, dict[str, Any]] = {}
 _pending_getstripe_chunks: dict[int, dict[str, Any]] = {}
 _pending_covn_chunks: dict[int, dict[str, Any]] = {}
+_pending_cokr_chunks: dict[int, dict[str, Any]] = {}
 
 
 def _enable_large_single_window() -> None:
@@ -386,6 +387,59 @@ def _cancel_covn_capture(user_id: int, chat_id: int) -> bool:
 def _has_pending_covn_capture(user_id: int, chat_id: int) -> bool:
     with _driver_lock:
         pending = _pending_covn_chunks.get(user_id)
+        return bool(pending and int(pending.get("chat_id") or 0) == int(chat_id))
+
+
+def _start_cokr_capture(user_id: int, chat_id: int) -> None:
+    with _driver_lock:
+        _pending_cokr_chunks[user_id] = {
+            "chat_id": chat_id,
+            "chunks": [],
+            "created_at": time.time(),
+        }
+
+
+def _append_cokr_chunk(user_id: int, chat_id: int, text: str) -> bool:
+    chunk = str(text or "")
+    with _driver_lock:
+        pending = _pending_cokr_chunks.get(user_id)
+        if not pending or int(pending.get("chat_id") or 0) != int(chat_id):
+            return False
+        pending.setdefault("chunks", []).append(chunk)
+        pending["updated_at"] = time.time()
+        return True
+
+
+def _peek_cokr_chunks(user_id: int, chat_id: int) -> str:
+    with _driver_lock:
+        pending = _pending_cokr_chunks.get(user_id)
+        if not pending or int(pending.get("chat_id") or 0) != int(chat_id):
+            return ""
+        chunks = list(pending.get("chunks") or [])
+    return "".join(chunks)
+
+
+def _pop_cokr_chunks(user_id: int, chat_id: int) -> str:
+    with _driver_lock:
+        pending = _pending_cokr_chunks.get(user_id)
+        if not pending or int(pending.get("chat_id") or 0) != int(chat_id):
+            return ""
+        _pending_cokr_chunks.pop(user_id, None)
+    return "".join(list(pending.get("chunks") or []))
+
+
+def _cancel_cokr_capture(user_id: int, chat_id: int) -> bool:
+    with _driver_lock:
+        pending = _pending_cokr_chunks.get(user_id)
+        if not pending or int(pending.get("chat_id") or 0) != int(chat_id):
+            return False
+        _pending_cokr_chunks.pop(user_id, None)
+        return True
+
+
+def _has_pending_cokr_capture(user_id: int, chat_id: int) -> bool:
+    with _driver_lock:
+        pending = _pending_cokr_chunks.get(user_id)
         return bool(pending and int(pending.get("chat_id") or 0) == int(chat_id))
 
 
@@ -827,6 +881,76 @@ def send_message(token: str, chat_id: int, text: str) -> None:
     return last_message_id
 
 
+def _resolve_redirect_url(url: str) -> str:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/136.0.0.0 Safari/537.36"
+        )
+    }
+    session = requests.Session()
+    current_url = url.strip()
+    visited: list[str] = []
+
+    for _ in range(12):
+        response = session.get(
+            current_url,
+            allow_redirects=False,
+            timeout=30,
+            headers=headers,
+        )
+        response.raise_for_status()
+        current_final = str(response.url or current_url).strip()
+        visited.append(current_final)
+        host = urlsplit(current_final).netloc.lower()
+        if "pay.openai.com" in host:
+            return current_final
+
+        if response.is_redirect or response.is_permanent_redirect:
+            location = str(response.headers.get("Location") or "").strip()
+            if not location:
+                break
+            next_url = urljoin(current_final, location)
+            next_host = urlsplit(next_url).netloc.lower()
+            if "pay.openai.com" in next_host:
+                return next_url
+            current_url = next_url
+            continue
+
+        if "/checkout/" not in current_final and current_final.rstrip("/") != "https://chatgpt.com":
+            return current_final
+        break
+
+    raise ValueError(
+        "Không suy ra được link dài từ chuỗi redirect. "
+        f"URL cuối quan sát được: {visited[-1] if visited else current_url}"
+    )
+
+
+def _resolve_redirect_url_via_driver(driver: Any, url: str) -> str:
+    driver.get(url)
+    deadline = time.time() + 20
+    last_url = ""
+    while time.time() < deadline:
+        try:
+            current_url = str(driver.current_url or "").strip()
+        except Exception:
+            current_url = ""
+        if current_url:
+            last_url = current_url
+            host = urlsplit(current_url).netloc.lower()
+            if "pay.openai.com" in host:
+                return current_url
+            if current_url != url and "/checkout/" not in current_url and current_url.rstrip("/") != "https://chatgpt.com":
+                return current_url
+        time.sleep(0.5)
+    raise ValueError(
+        "Không bắt được link đích qua browser/profile đang mở. "
+        f"URL cuối quan sát được: {last_url or url}"
+    )
+
+
 def send_document(token: str, chat_id: int, file_path: str, caption: str = "") -> None:
     with open(file_path, "rb") as f:
         requests.post(
@@ -989,7 +1113,7 @@ class TelegramProgress:
 
 
 def _clean_payload(text: str) -> str:
-    text = re.sub(r"^/regget(?:@\w+)?", "", text, count=1).strip()
+    text = re.sub(r"^/regget1?(?:@\w+)?", "", text, count=1).strip()
     text = text.replace("```", "").strip()
     return text
 
@@ -1121,6 +1245,7 @@ def _run_one_account(
     stop_event: threading.Event,
     progress: TelegramProgress | None = None,
     gopay_otp_callback=None,
+    reg_mode: str = "browser",
 ) -> dict[str, Any]:
     with _global_browser_slots:
         if stop_event.is_set():
@@ -1150,7 +1275,12 @@ def _run_one_account(
                 raise InterruptedError("Người dùng đã dừng job")
 
         try:
-            result = main.register_one_account_with_profile_retries(
+            register_func = (
+                main.register_one_account_api_first_with_profile_retries
+                if reg_mode == "api_first"
+                else main.register_one_account_with_profile_retries
+            )
+            result = register_func(
                 monitor_callback=monitor,
                 email_context_override=account,
                 account_password_override=_default_password() or None,
@@ -1509,6 +1639,119 @@ def _run_covn_raw_session_job(
         send_message(token, chat_id, f"❌ COVN_FAIL\n{e}")
 
 
+def _run_cokr_job(
+    token: str,
+    chat_id: int,
+    user_id: int,
+    username: str,
+    is_admin: bool,
+) -> None:
+    driver = _latest_driver_for(user_id)
+    if not driver:
+        send_message(token, chat_id, "❌ COKR_FAIL\nKhông thấy browser/profile nào đang mở để lấy session.")
+        return
+
+    try:
+        send_message(token, chat_id, "🇰🇷🔐 Đang lấy auth session hiện tại để tạo checkout KR...")
+        result = checkout_new.create_kr_trial_checkout(driver, log_func=_log)
+        if result.get("success"):
+            checkout_url = str(result.get("checkout_url") or "").strip()
+            send_message(token, chat_id, f"🇰🇷🎉 COKR_OK\n🔗 {checkout_url}")
+        else:
+            reason = str(result.get("failure_reason") or "Tạo checkout KR thất bại").strip()
+            send_message(token, chat_id, f"❌ COKR_FAIL\n{reason}")
+    except Exception as e:
+        send_message(token, chat_id, f"❌ COKR_FAIL\n{e}")
+
+
+def _run_cokr_raw_session_job(
+    token: str,
+    chat_id: int,
+    user_id: int,
+    is_admin: bool,
+    raw_payload: str,
+) -> None:
+    try:
+        payload_text = str(raw_payload or "").strip()
+        if not payload_text:
+            send_message(token, chat_id, "❌ COKR_FAIL\nThiếu raw session JSON")
+            return
+        send_message(token, chat_id, f"📥 Đã nhận session cho cokr. Độ dài thô: {len(payload_text)} ký tự. Đang kiểm tra JSON...")
+        payload_text = _prepare_session_json_payload(payload_text)
+        try:
+            parsed = json.loads(payload_text)
+        except Exception as e:
+            send_message(token, chat_id, f"❌ COKR_FAIL\nSession JSON không hợp lệ: {e}")
+            return
+        token_value = str(checkout_new._extract_bearer_token(parsed) or "").strip()
+        if not token_value:
+            send_message(token, chat_id, "❌ COKR_FAIL\nKhông tìm thấy access token trong session JSON")
+            return
+        session_token = str(parsed.get("sessionToken") or "").strip() if isinstance(parsed, dict) else ""
+        synthetic_cookies: list[dict[str, Any]] = []
+        if session_token:
+            synthetic_cookies.extend([
+                {"name": "__Secure-next-auth.session-token", "value": session_token, "domain": "chatgpt.com", "path": "/"},
+                {"name": "next-auth.session-token", "value": session_token, "domain": "chatgpt.com", "path": "/"},
+                {"name": "__Secure-next-auth.session-token", "value": session_token, "domain": ".chatgpt.com", "path": "/"},
+                {"name": "next-auth.session-token", "value": session_token, "domain": ".chatgpt.com", "path": "/"},
+                {"name": "__Secure-authjs.session-token", "value": session_token, "domain": "chatgpt.com", "path": "/"},
+                {"name": "authjs.session-token", "value": session_token, "domain": "chatgpt.com", "path": "/"},
+                {"name": "__Secure-authjs.session-token", "value": session_token, "domain": ".chatgpt.com", "path": "/"},
+                {"name": "authjs.session-token", "value": session_token, "domain": ".chatgpt.com", "path": "/"},
+            ])
+        send_message(token, chat_id, "🧩 Đã parse session JSON cho cokr. Đang gọi checkout KR...")
+        result = checkout_new.create_kr_trial_checkout_from_auth_context(
+            {
+                "token": token_value,
+                "cookies": synthetic_cookies,
+                "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+            },
+            log_func=_log,
+        )
+        if result.get("success"):
+            send_message(token, chat_id, f"🇰🇷🎉 COKR_OK\n🔗 {str(result.get('checkout_url') or '').strip()}")
+        else:
+            send_message(token, chat_id, f"❌ COKR_FAIL\n{str(result.get('failure_reason') or 'checkout KR thất bại').strip()}")
+    except Exception as e:
+        send_message(token, chat_id, f"❌ COKR_FAIL\n{e}")
+
+
+def _run_cv_job(
+    token: str,
+    chat_id: int,
+    user_id: int,
+    short_url: str,
+) -> None:
+    try:
+        send_message(token, chat_id, "🔎 Đang mở link ngắn và lấy link đích...")
+        final_url = _resolve_redirect_url(short_url)
+        if not final_url:
+            send_message(token, chat_id, "❌ CV_FAIL\nKhông lấy được link đích cuối cùng.")
+            return
+        send_message(token, chat_id, f"🎉 CV_OK\n🔗 {final_url}")
+    except Exception as e:
+        message = str(e).strip()
+        if "403" in message or "forbidden" in message.lower():
+            driver = _latest_driver_for(user_id)
+            if driver:
+                try:
+                    send_message(token, chat_id, "🔐 Link ngắn yêu cầu đăng nhập. Đang thử lại bằng browser/profile hiện tại...")
+                    final_url = _resolve_redirect_url_via_driver(driver, short_url)
+                    send_message(token, chat_id, f"🎉 CV_OK\n🔗 {final_url}")
+                    return
+                except Exception as inner:
+                    send_message(token, chat_id, f"❌ CV_FAIL\n{str(inner).strip()}")
+                    return
+            send_message(
+                token,
+                chat_id,
+                "❌ CV_FAIL\nLink ngắn này yêu cầu ngữ cảnh đăng nhập. Mở sẵn browser/profile ChatGPT rồi thử lại /cv.",
+            )
+            return
+        send_message(token, chat_id, f"❌ CV_FAIL\n{message}")
+
+
 def _user_label(user_id: int, username: str = "") -> str:
     username = (username or "").strip()
     if username:
@@ -1579,6 +1822,8 @@ def _run_regget_job(
     username: str,
     accounts: list[Any],
     is_admin: bool,
+    reg_mode: str = "browser",
+    command_name: str = "/regget",
 ) -> None:
     slot = _user_slot(user_id, is_admin=is_admin)
     if not slot.acquire(blocking=False):
@@ -1622,7 +1867,7 @@ def _run_regget_job(
         threading.Thread(target=watchdog, daemon=True).start()
         threading.Thread(target=heartbeat, daemon=True).start()
         progress.set(1, "Đã nhận lệnh")
-        _log(f"{_user_label(user_id, username)} bắt đầu /regget với {len(accounts)} cụm mail")
+        _log(f"{_user_label(user_id, username)} bắt đầu {command_name} với {len(accounts)} cụm mail")
         results: list[tuple[Any, dict[str, Any]]] = []
         credit_state = {"charged": False}
         single_account_large_window = len(accounts) == 1
@@ -1645,6 +1890,7 @@ def _run_regget_job(
                         lambda prompt="Đã tới bước OTP GoPay.": _await_gopay_otp_from_telegram(
                             token, chat_id, user_id, username, prompt
                         ),
+                        reg_mode,
                     ): account
                     for account in accounts
                 }
@@ -1669,7 +1915,7 @@ def _run_regget_job(
                     otp_callback = lambda prompt="Đã tới bước OTP GoPay.": _await_gopay_otp_from_telegram(
                         token, chat_id, user_id, username, prompt
                     )
-                    result = _run_one_account(account, user_id, stop_event, progress, otp_callback)
+                    result = _run_one_account(account, user_id, stop_event, progress, otp_callback, reg_mode)
                 except InterruptedError:
                     progress.set(progress.percent, f"Đã dừng {account.email}")
                     result = {"success": False, "failure_reason": "Đã dừng theo lệnh /stop", "checkout_url": ""}
@@ -1821,6 +2067,11 @@ def _help_text(is_admin: bool) -> str:
         "Gửi theo mẫu:\n"
         "/regget email|mật_khẩu_mail|refresh_token|client_id\n"
         "Hoặc gửi file .txt kèm caption /regget.\n\n"
+        "/regget1\n"
+        "Bản API-first của /regget: tạo account/OTP bằng API trước, rồi mới mở browser để bật 2FA và lấy link KR.\n"
+        "Gửi theo mẫu:\n"
+        "/regget1 email|mật_khẩu_mail|refresh_token|client_id\n"
+        "Hoặc gửi file .txt kèm caption /regget1.\n\n"
         "/regcv\n"
         "Dùng để đăng ký Canva bằng Hotmail rồi redeem code AFRICAGROW.\n"
         "Gửi theo mẫu:\n"
@@ -1840,12 +2091,22 @@ def _help_text(is_admin: bool) -> str:
         "1. /get session\n"
         "2. /get rồi dán nhiều đoạn, xong gửi /getdone\n"
         "3. Gửi file .txt/.json kèm caption /get\n\n"
+        "/cv\n"
+        "Đổi link checkout ngắn sang link dài cuối cùng.\n"
+        "Ví dụ:\n"
+        "/cv https://chatgpt.com/checkout/...\n\n"
         "/covn\n"
         "Dùng để tạo checkout VN tối ưu Apple Pay.\n"
         "Có 3 cách:\n"
         "1. /covn session\n"
         "2. /covn rồi dán nhiều đoạn, xong gửi /covndone\n"
         "3. Gửi file .txt/.json kèm caption /covn\n\n"
+        "/cokr\n"
+        "Dùng để tạo checkout KR theo payload Hàn Quốc.\n"
+        "Có 3 cách:\n"
+        "1. /cokr session\n"
+        "2. /cokr rồi dán nhiều đoạn, xong gửi /cokrdone\n"
+        "3. Gửi file .txt/.json kèm caption /cokr\n\n"
         "/getstripe\n"
         "Dùng để đổi session sang checkout link của checkout_new.\n"
         "Có 3 cách:\n"
@@ -1882,11 +2143,14 @@ def _telegram_menu_commands() -> list[dict[str, str]]:
     return [
         {"command": "tut", "description": "Xem nội dung hướng dẫn đã cài"},
         {"command": "regget", "description": "Đăng ký và lấy link thanh toán"},
+        {"command": "regget1", "description": "API-first đăng ký + 2FA + link KR"},
         {"command": "regcv", "description": "Đăng ký Canva + redeem AFRICAGROW"},
         {"command": "addprx", "description": "Lưu proxy cho Canva"},
         {"command": "checkprx", "description": "Xem proxy Canva hiện tại"},
         {"command": "get", "description": "Lấy session hiện tại -> link Midtrans"},
+        {"command": "cv", "description": "Đổi link checkout ngắn -> dài"},
         {"command": "covn", "description": "Tạo checkout VN tối ưu Apple Pay"},
+        {"command": "cokr", "description": "Tạo checkout KR trial 0 đồng"},
         {"command": "getstripe", "description": "Lấy session hiện tại -> checkout link"},
         {"command": "addtut", "description": "Admin cập nhật nội dung /tut"},
         {"command": "unban", "description": "Admin bỏ ban user"},
@@ -2091,6 +2355,22 @@ def handle_update(token: str, update: dict[str, Any]) -> None:
             daemon=True,
         ).start()
         return
+    if not text and document and _has_pending_cokr_capture(user_id, chat_id):
+        try:
+            payload = _download_telegram_text_document(token, document).strip()
+        except Exception as e:
+            send_message(token, chat_id, f"COKR_FAIL\nKhông đọc được file session: {e}")
+            return
+        if not payload:
+            send_message(token, chat_id, "COKR_FAIL\nFile session rỗng")
+            return
+        _cancel_cokr_capture(user_id, chat_id)
+        threading.Thread(
+            target=_run_cokr_raw_session_job,
+            args=(token, chat_id, user_id, is_admin, payload),
+            daemon=True,
+        ).start()
+        return
     if not text:
         return
 
@@ -2110,16 +2390,20 @@ def handle_update(token: str, update: dict[str, Any]) -> None:
             "/menu",
             "/tut",
             "/regget",
+            "/regget1",
             "/regcv",
             "/addprx",
             "/checkprx",
             "/get",
+            "/cv",
             "/covn",
+            "/cokr",
             "/getdone",
             "/getcancel",
-            "/covn",
             "/covndone",
             "/covncancel",
+            "/cokrdone",
+            "/cokrcancel",
             "/getstripe",
             "/getstripedone",
             "/getstripecancel",
@@ -2128,7 +2412,7 @@ def handle_update(token: str, update: dict[str, Any]) -> None:
             send_message(
                 token,
                 chat_id,
-                "User thường chỉ dùng được: /tut, /regget, /regcv, /addprx, /checkprx, /get, /covn, /getstripe. Gửi /menu để xem hướng dẫn.",
+                "User thường chỉ dùng được: /tut, /regget, /regget1, /regcv, /addprx, /checkprx, /get, /cv, /covn, /cokr, /getstripe. Gửi /menu để xem hướng dẫn.",
             )
             return
 
@@ -2226,6 +2510,25 @@ def handle_update(token: str, update: dict[str, Any]) -> None:
             send_message(token, chat_id, "Không có chế độ /covn nào đang chờ để hủy.")
         return
 
+    if command == "/cokrdone":
+        payload = _pop_cokr_chunks(user_id, chat_id)
+        if not payload:
+            send_message(token, chat_id, "Không có phiên /cokr nào đang chờ ghép chuỗi.")
+            return
+        threading.Thread(
+            target=_run_cokr_raw_session_job,
+            args=(token, chat_id, user_id, is_admin, payload),
+            daemon=True,
+        ).start()
+        return
+
+    if command == "/cokrcancel":
+        if _cancel_cokr_capture(user_id, chat_id):
+            send_message(token, chat_id, "Đã hủy chế độ dán session cho /cokr.")
+        else:
+            send_message(token, chat_id, "Không có chế độ /cokr nào đang chờ để hủy.")
+        return
+
     if _has_pending_get_session_capture(user_id, chat_id) and command not in {"/get"}:
         if _append_get_session_chunk(user_id, chat_id, text):
             preview_payload = _peek_get_session_chunks(user_id, chat_id)
@@ -2257,6 +2560,18 @@ def handle_update(token: str, update: dict[str, Any]) -> None:
             if payload:
                 threading.Thread(
                     target=_run_covn_raw_session_job,
+                    args=(token, chat_id, user_id, is_admin, payload),
+                    daemon=True,
+                ).start()
+                return
+            return
+    if _has_pending_cokr_capture(user_id, chat_id) and command not in {"/cokr"}:
+        if _append_cokr_chunk(user_id, chat_id, text):
+            preview_payload = _peek_cokr_chunks(user_id, chat_id)
+            payload = _pop_cokr_chunks(user_id, chat_id) if _looks_like_complete_session_json(preview_payload) else ""
+            if payload:
+                threading.Thread(
+                    target=_run_cokr_raw_session_job,
                     args=(token, chat_id, user_id, is_admin, payload),
                     daemon=True,
                 ).start()
@@ -2422,7 +2737,7 @@ def handle_update(token: str, update: dict[str, Any]) -> None:
             send_message(token, chat_id, str(e))
         return
 
-    if command == "/regget":
+    if command in {"/regget", "/regget1"}:
         try:
             payload = _clean_payload(text)
             if not payload and document:
@@ -2446,7 +2761,16 @@ def handle_update(token: str, update: dict[str, Any]) -> None:
 
         threading.Thread(
             target=_run_regget_job,
-            args=(token, chat_id, user_id, username, accounts, is_admin),
+            args=(
+                token,
+                chat_id,
+                user_id,
+                username,
+                accounts,
+                is_admin,
+                "api_first" if command == "/regget1" else "browser",
+                command,
+            ),
             daemon=True,
         ).start()
         return
@@ -2504,6 +2828,21 @@ def handle_update(token: str, update: dict[str, Any]) -> None:
         ).start()
         return
 
+    if command == "/cv":
+        short_url = args.strip()
+        if not short_url:
+            send_message(token, chat_id, "Định dạng: /cv https://chatgpt.com/checkout/...")
+            return
+        if not re.match(r"^https?://", short_url, flags=re.IGNORECASE):
+            send_message(token, chat_id, "Link /cv phải bắt đầu bằng http:// hoặc https://")
+            return
+        threading.Thread(
+            target=_run_cv_job,
+            args=(token, chat_id, user_id, short_url),
+            daemon=True,
+        ).start()
+        return
+
     if command == "/covn":
         raw_args = args.strip()
         mode = raw_args.lower()
@@ -2546,6 +2885,50 @@ def handle_update(token: str, update: dict[str, Any]) -> None:
             _append_covn_chunk(user_id, chat_id, raw_args)
             return
         send_message(token, chat_id, "Định dạng:\n/covn session\n/covn rồi dán nhiều đoạn text, kết thúc bằng /covndone\nhoặc\n/covn {full-json-session}\nhoặc gửi file .txt/.json với caption /covn")
+        return
+
+    if command == "/cokr":
+        raw_args = args.strip()
+        mode = raw_args.lower()
+        if mode == "session":
+            threading.Thread(
+                target=_run_cokr_job,
+                args=(token, chat_id, user_id, username, is_admin),
+                daemon=True,
+            ).start()
+            return
+        if not raw_args and not document:
+            _start_cokr_capture(user_id, chat_id)
+            send_message(token, chat_id, "Đã bật chế độ dán session cho /cokr. Gửi nhiều đoạn text liên tiếp, xong thì gửi /cokrdone. Muốn hủy thì /cokrcancel.")
+            return
+        if document:
+            try:
+                payload = _download_telegram_text_document(token, document).strip()
+            except Exception as e:
+                send_message(token, chat_id, f"COKR_FAIL\nKhông đọc được file session: {e}")
+                return
+            if not payload:
+                send_message(token, chat_id, "COKR_FAIL\nFile session rỗng")
+                return
+            _cancel_cokr_capture(user_id, chat_id)
+            threading.Thread(
+                target=_run_cokr_raw_session_job,
+                args=(token, chat_id, user_id, is_admin, payload),
+                daemon=True,
+            ).start()
+            return
+        if raw_args.startswith("{"):
+            if _looks_like_complete_session_json(raw_args):
+                threading.Thread(
+                    target=_run_cokr_raw_session_job,
+                    args=(token, chat_id, user_id, is_admin, raw_args),
+                    daemon=True,
+                ).start()
+                return
+            _start_cokr_capture(user_id, chat_id)
+            _append_cokr_chunk(user_id, chat_id, raw_args)
+            return
+        send_message(token, chat_id, "Định dạng:\n/cokr session\n/cokr rồi dán nhiều đoạn text, kết thúc bằng /cokrdone\nhoặc\n/cokr {full-json-session}\nhoặc gửi file .txt/.json với caption /cokr")
         return
 
     if command == "/get":

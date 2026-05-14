@@ -39,6 +39,7 @@ registered_accounts.txt
 hotmail_accounts.txt
 successful_accounts.txt
 failed_accounts.txt
+2fa_secrets.txt
 telegram_bot_state.json
 telegram_bot_state.tmp
 telegram_token.txt
